@@ -1,0 +1,1430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#0f172a">
+  <title>GTD – Getting Things Done</title>
+
+  <!-- PWA: installable on Android home screen & Windows; works offline -->
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/svg+xml" href="static/icons/icon.svg">
+  <link rel="apple-touch-icon" href="static/icons/icon-192.png">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="GTD">
+
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Microsoft Authentication Library — used only for the OPTIONAL OneDrive cloud sync -->
+  <script src="https://alcdn.msauthcdn.com/lib/2.x/js/msal-browser.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { margin: 0; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useCallback } = React;
+
+    const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
+    const LISTS    = ["inbox","next","projects","waiting","someday","reference","done"];
+    const META = {
+      inbox:     { icon:"📥", label:"Inbox",         hint:"Capture everything — process later" },
+      next:      { icon:"⚡", label:"Next Actions",   hint:"Next physical, visible actions" },
+      projects:  { icon:"📋", label:"Projects",       hint:"Outcomes needing more than one step" },
+      waiting:   { icon:"⏳", label:"Waiting For",    hint:"Delegated to or expected from others" },
+      someday:   { icon:"🌟", label:"Someday/Maybe",  hint:"Ideas to revisit when the time is right" },
+      reference: { icon:"📁", label:"Reference",      hint:"Non-actionable — keep for future lookup" },
+      done:      { icon:"✅", label:"Done",           hint:"Completed items" },
+    };
+
+    // ── Helpers ───────────────────────────────────────────────────
+    const ts      = () => new Date().toISOString();
+    const mk      = t  => ({ id: Date.now()+Math.random(), title:t.trim(), created:ts(), context:"@anywhere", dueDate:"", waitingFor:"" });
+    const exProj  = t  => { const m=(t||"").match(/^\[([^\]]+)\]/); return m?m[1]:null; };
+    const fmtDate = d  => { try{ return new Date(d).toLocaleDateString("vi-VN",{day:"2-digit",month:"2-digit",year:"numeric"}); }catch{return d||"";} };
+    const relTime = t  => { if(!t) return ""; const s=Math.max(0,Math.floor((Date.now()-t)/1000)); if(s<60) return "just now"; const m=Math.floor(s/60); if(m<60) return m+"m ago"; const h=Math.floor(m/60); if(h<24) return h+"h ago"; return Math.floor(h/24)+"d ago"; };
+    const isOver  = d  => d && new Date(d+"T23:59") < new Date();
+    const fresh   = () => ({ inbox:[], next:[], projects:[], waiting:[], someday:[], reference:[], done:[] });
+    // Pick the candidate with the newest _updatedAt (strict — ties keep the earlier one,
+    // so local wins ties and remotes are adopted only when genuinely newer).
+    const pickNewest = cands => {
+      const valid = cands.filter(c => c && c.data);
+      if (!valid.length) return null;
+      return valid.reduce((best, c) => ((c.data._updatedAt||0) > (best.data._updatedAt||0) ? c : best));
+    };
+
+    // ── Storage: offline-first ────────────────────────────────────
+    // localStorage is the source of truth on every device (instant, works with
+    // no server). The Flask /api/state endpoint is an OPTIONAL sync hub used
+    // only when reachable (same PC / LAN / Tailscale). Reconciliation is
+    // last-write-wins on a state-level `_updatedAt` timestamp.
+    const LS_KEY    = "gtd_state_v1";
+    const withStamp = d => ({ ...d, _updatedAt: Date.now() });
+    const Store = {
+      loadLocal() {
+        try { const s = localStorage.getItem(LS_KEY); return s ? JSON.parse(s) : null; }
+        catch { return null; }
+      },
+      saveLocal(d) {
+        try { localStorage.setItem(LS_KEY, JSON.stringify(d)); } catch {}
+      },
+      async fetchServer(timeout=2000) {
+        try {
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), timeout);
+          const r = await fetch("api/state", { signal: ctrl.signal });
+          clearTimeout(t);
+          if (!r.ok) return null;
+          const d = await r.json();
+          return (d && Object.keys(d).length) ? d : null;
+        } catch { return null; }
+      },
+      pushServer(d) {
+        try {
+          fetch("api/state", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(d),
+            keepalive: true,
+          }).catch(() => {});
+        } catch {}
+      },
+    };
+    // ── OneDrive (Microsoft Graph) — optional cloud remote ───────
+    // Lets every device (incl. the phone) sync the same gtd_state.json straight
+    // to the user's personal OneDrive with NO server, via the Graph API. Paste
+    // your Azure SPA "Application (client) ID" below — it's a PUBLIC SPA client
+    // id (not a secret), safe to commit/deploy. Blank ⇒ cloud sync stays off and
+    // the app behaves exactly as before. One-time app registration: see README.
+    const MS_CLIENT_ID = "";
+    const MS_AUTHORITY = "https://login.microsoftonline.com/consumers";  // personal MS accounts
+    const MS_SCOPES    = ["Files.ReadWrite.AppFolder"];                  // only the app's own folder
+    const OD_FLAG      = "gtd_onedrive_enabled";
+    const GRAPH_ITEM   = "https://graph.microsoft.com/v1.0/me/drive/special/approot:/gtd_state.json";
+
+    const Drive = {
+      _msal: null,
+      _etag: null,
+      available() { return !!MS_CLIENT_ID && typeof msal !== "undefined"; },
+      enabled()   { try { return localStorage.getItem(OD_FLAG) === "1"; } catch { return false; } },
+      init() {
+        if (this._msal || !this.available()) return this._msal;
+        this._msal = new msal.PublicClientApplication({
+          auth:  { clientId: MS_CLIENT_ID, authority: MS_AUTHORITY, redirectUri: location.origin + location.pathname },
+          cache: { cacheLocation: "localStorage" },
+        });
+        return this._msal;
+      },
+      account() {
+        const m = this.init(); if (!m) return null;
+        const all = m.getAllAccounts();
+        return all && all.length ? all[0] : null;
+      },
+      async connect() {
+        const m = this.init(); if (!m) return null;
+        const res = await m.loginPopup({ scopes: MS_SCOPES, prompt: "select_account" });
+        if (res && res.account) { m.setActiveAccount(res.account); try { localStorage.setItem(OD_FLAG, "1"); } catch {} }
+        return this.account();
+      },
+      async disconnect() {
+        try { localStorage.removeItem(OD_FLAG); } catch {}
+        this._etag = null;
+        const m = this.init(); const acct = this.account();
+        if (m && acct) { try { await m.logoutPopup({ account: acct }); } catch {} }
+      },
+      async _token() {
+        const m = this.init(); const acct = this.account();
+        if (!m || !acct) throw new Error("not connected");
+        try   { return (await m.acquireTokenSilent({ scopes: MS_SCOPES, account: acct })).accessToken; }
+        catch { return (await m.acquireTokenPopup ({ scopes: MS_SCOPES, account: acct })).accessToken; }
+      },
+      // → { data, etag }; data null when the file doesn't exist yet. null on any failure.
+      async pull() {
+        if (!this.available() || !this.enabled() || !this.account()) return null;
+        try {
+          const tok  = await this._token();
+          const auth = { Authorization: "Bearer " + tok };
+          const meta = await fetch(GRAPH_ITEM, { headers: auth });
+          if (meta.status === 404) { this._etag = null; return { data: null, etag: null }; }
+          if (!meta.ok) return null;
+          const item = await meta.json();
+          this._etag = item.eTag || null;
+          const body = await fetch(GRAPH_ITEM + ":/content", { headers: auth });
+          if (!body.ok) return null;
+          const data = await body.json();
+          return { data: (data && Object.keys(data).length) ? data : null, etag: this._etag };
+        } catch { return null; }
+      },
+      // Best-effort conflict-safe write (If-Match on eTag). → true on success.
+      async push(d, retry = true) {
+        if (!this.available() || !this.enabled() || !this.account()) return false;
+        try {
+          const tok = await this._token();
+          const headers = { Authorization: "Bearer " + tok, "Content-Type": "application/json" };
+          if (this._etag) headers["If-Match"] = this._etag;
+          const r = await fetch(GRAPH_ITEM + ":/content", { method:"PUT", headers, body: JSON.stringify(d) });
+          if (r.status === 412 && retry) {                 // someone else wrote first
+            const remote = await this.pull();              // refreshes this._etag
+            if (remote && remote.data && (remote.data._updatedAt || 0) > (d._updatedAt || 0)) return false; // remote newer — let poll adopt
+            return this.push(d, false);                    // we're newer — overwrite with fresh etag
+          }
+          if (!r.ok) return false;
+          const item = await r.json();
+          this._etag = item.eTag || this._etag;
+          return true;
+        } catch { return false; }
+      },
+    };
+
+    // ── Data portability: export / import a JSON backup ──────────
+    // Offline, server-free way to move data between devices and to back it up.
+    // Export → a downloadable (or shareable, on mobile) gtd-backup-*.json file.
+    // Import → MERGE (union by item id) or REPLACE the device's data.
+    const pickLists = src => Object.fromEntries(LISTS.map(l => [l, Array.isArray(src[l]) ? src[l] : []]));
+
+    const looksLikeState = d => d && typeof d === "object" && LISTS.some(l => Array.isArray(d[l]));
+
+    const mergeStates = (base, incoming) => {
+      const out = fresh();
+      LISTS.forEach(l => {
+        const map = new Map();
+        (base[l] || []).forEach(i => map.set(i.id, i));
+        (incoming[l] || []).forEach(i => map.set(i.id, i)); // incoming wins on id clash
+        out[l] = Array.from(map.values());
+      });
+      return out;
+    };
+
+    const exportData = data => {
+      const payload = JSON.stringify(data, null, 2);
+      const fname   = `gtd-backup-${new Date().toISOString().slice(0,10)}.json`;
+      const blob    = new Blob([payload], { type: "application/json" });
+      const file    = (typeof File !== "undefined") ? new File([blob], fname, { type:"application/json" }) : null;
+      // Mobile: native share sheet (AirDrop / Nearby / messaging) when it can share files.
+      if (file && navigator.canShare && navigator.canShare({ files:[file] })) {
+        navigator.share({ files:[file], title:"GTD backup" }).catch(() => {});
+        return;
+      }
+      const url = URL.createObjectURL(blob);
+      const a   = document.createElement("a");
+      a.href = url; a.download = fname;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
+
+    const placeFor = l => ({ inbox:"Capture…", next:"[Project] Next action…", projects:"Project outcome…", waiting:"Waiting for…", someday:"Someday idea…", reference:"Reference title…" }[l]||"Add item…");
+
+    const doneByTime = items => {
+      const now   = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const week  = new Date(today); week.setDate(today.getDate()-6);
+      const month = new Date(today); month.setDate(today.getDate()-29);
+      const buckets = [
+        { label:"Today",      test:d=>d>=today,             defaultOpen:true  },
+        { label:"This week",  test:d=>d>=week&&d<today,     defaultOpen:true  },
+        { label:"This month", test:d=>d>=month&&d<week,     defaultOpen:false },
+        { label:"Older",      test:d=>d<month,              defaultOpen:false },
+      ];
+      return buckets
+        .map(b => ({ ...b, items: items.filter(i => b.test(new Date(i.doneAt||i.created))) }))
+        .filter(b => b.items.length > 0);
+    };
+
+    const doneByProject = items => {
+      const map = {};
+      items.forEach(i => { const p=exProj(i.title)||"Standalone"; (map[p]=map[p]||[]).push(i); });
+      return Object.entries(map).map(([label,items]) => ({ label, items, defaultOpen:true }));
+    };
+
+    // ── App ───────────────────────────────────────────────────────
+    function App() {
+      const [items, setItems]             = useState(null);
+      const [active, setActive]           = useState("next");
+      const [ctx, setCtx]                 = useState("all");
+      const [capture, setCapture]         = useState("");
+      const [showForm, setShowForm]       = useState(false);
+      const [form, setForm]               = useState({title:"",context:"@anywhere",dueDate:"",waitingFor:""});
+      const [procItem, setProcItem]       = useState(null);
+      const [complCand, setComplCand]     = useState(null);
+      const [history,  setHistory]        = useState([]);
+      const [showData, setShowData]       = useState(false);
+      const fileInputRef = React.useRef(null);
+      const importMode   = React.useRef("merge");
+      // OneDrive cloud sync (optional)
+      const [odAccount, setOdAccount]     = useState(() => Drive.account());
+      const [syncing,   setSyncing]       = useState(false);
+      const [syncTick,  setSyncTick]      = useState(0);   // bump to re-render the "last synced" label
+      const itemsRef    = React.useRef(null);
+      const lastSyncRef = React.useRef(0);
+      const driveTimer  = React.useRef(null);
+
+      // ── heartbeat — when served by Flask on the PC, lets the server exit
+      //    once the browser closes. Harmless (and silently ignored) offline. ──
+      useEffect(() => {
+        const id = setInterval(() => fetch("api/ping", {method:"POST"}).catch(()=>{}), 5000);
+        return () => clearInterval(id);
+      }, []);
+
+      // keep a ref of the latest items for async sync callbacks (avoids stale closures)
+      useEffect(() => { itemsRef.current = items; }, [items]);
+
+      // process any pending MSAL redirect response once on load (no-op for popup flow)
+      useEffect(() => { const m = Drive.init(); if (m) m.handleRedirectPromise().catch(() => {}); }, []);
+
+      // ── offline-first load: show local immediately, then reconcile with the
+      //    optional remotes (Flask hub + OneDrive) by last-write-wins on
+      //    _updatedAt. localStorage stays the source of truth on each device. ──
+      useEffect(() => {
+        const base      = fresh();
+        const local     = Store.loadLocal();
+        const localFull = local ? { ...base, ...local } : base;
+        setItems(localFull);
+        (async () => {
+          const [server, drive] = await Promise.all([ Store.fetchServer(), Drive.pull() ]);
+          const winner = pickNewest([
+            { src:"local", data: local || null },
+            { src:"flask", data: server || null },
+            { src:"drive", data: drive && drive.data ? drive.data : null },
+          ]);
+          const chosen = winner && winner.data ? { ...base, ...winner.data } : localFull;
+          if (winner && winner.src !== "local") { setItems(chosen); Store.saveLocal(chosen); }
+          const cT = chosen._updatedAt || 0;
+          if (!server || (server._updatedAt || 0) < cT) Store.pushServer(chosen);             // push to Flask if behind
+          if (Drive.enabled() && (!drive || ((drive.data && drive.data._updatedAt) || 0) < cT)) Drive.push(chosen);
+          lastSyncRef.current = Date.now();
+          setSyncTick(t => t + 1);
+        })();
+      }, []);
+
+      // ── poll OneDrive for changes made on other devices (Graph has no push) ──
+      useEffect(() => {
+        if (!Drive.available()) return;
+        const id = setInterval(async () => {
+          if (!Drive.enabled()) return;
+          const remote = await Drive.pull();
+          if (!remote || !remote.data) return;
+          const cur = itemsRef.current || fresh();
+          if ((remote.data._updatedAt || 0) > (cur._updatedAt || 0)) {
+            const merged = { ...fresh(), ...remote.data };
+            setItems(merged); Store.saveLocal(merged); Store.pushServer(merged);
+            lastSyncRef.current = Date.now(); setSyncTick(t => t + 1);
+          }
+        }, 45000);
+        return () => clearInterval(id);
+      }, []);
+
+      // debounced push to OneDrive so rapid edits don't spam Graph
+      const drivePush = useCallback(d => {
+        if (!Drive.enabled()) return;
+        if (driveTimer.current) clearTimeout(driveTimer.current);
+        driveTimer.current = setTimeout(() => {
+          Drive.push(d).then(ok => { if (ok) { lastSyncRef.current = Date.now(); setSyncTick(t => t + 1); } });
+        }, 2000);
+      }, []);
+
+      const persist = useCallback(d => {
+        Store.saveLocal(d);
+        Store.pushServer(d);
+        drivePush(d);
+      }, [drivePush]);
+
+      // ── OneDrive connect / disconnect / manual sync ──
+      const syncNow = useCallback(async () => {
+        if (!Drive.enabled()) return;
+        setSyncing(true);
+        try {
+          const remote = await Drive.pull();
+          const cur    = itemsRef.current || fresh();
+          const rT     = (remote && remote.data && remote.data._updatedAt) || 0;
+          if (rT > (cur._updatedAt || 0)) {                // remote newer → adopt
+            const merged = { ...fresh(), ...remote.data };
+            setItems(merged); Store.saveLocal(merged); Store.pushServer(merged);
+          } else {                                         // local newer/equal → push up
+            await Drive.push(cur);
+          }
+          lastSyncRef.current = Date.now(); setSyncTick(t => t + 1);
+        } finally { setSyncing(false); }
+      }, []);
+
+      const connectDrive = useCallback(async () => {
+        try { const a = await Drive.connect(); setOdAccount(a); if (a) await syncNow(); }
+        catch { alert("Could not connect to OneDrive — check your client ID / app registration."); }
+      }, [syncNow]);
+
+      const disconnectDrive = useCallback(async () => {
+        await Drive.disconnect(); setOdAccount(null); setSyncTick(t => t + 1);
+      }, []);
+
+      const upd = useCallback(d => {
+        const stamped = withStamp(d);
+        setHistory(h => [...h.slice(-19), items]);
+        setItems(stamped);
+        persist(stamped);
+      }, [items, persist]);
+
+      const undo = useCallback(() => {
+        if (history.length === 0) return;
+        const prev = withStamp(history[history.length - 1]);
+        setHistory(h => h.slice(0, -1));
+        setItems(prev);
+        persist(prev);
+      }, [history, persist]);
+
+      useEffect(() => {
+        const onKey = e => { if ((e.ctrlKey||e.metaKey) && e.key==="z" && !e.shiftKey) { e.preventDefault(); undo(); } };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, [undo]);
+
+      // ── data export / import ──
+      const triggerImport = mode => { importMode.current = mode; if (fileInputRef.current) fileInputRef.current.click(); };
+
+      const onImportFile = e => {
+        const f = e.target.files && e.target.files[0];
+        e.target.value = "";                                // allow picking the same file again
+        if (!f) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          let parsed;
+          try { parsed = JSON.parse(reader.result); }
+          catch { alert("Could not read that file — is it a valid GTD backup (.json)?"); return; }
+          if (!looksLikeState(parsed)) { alert("That doesn't look like a GTD backup file."); return; }
+          const next = importMode.current === "replace"
+            ? { ...fresh(), ...pickLists(parsed) }
+            : mergeStates(items, parsed);
+          upd(next);
+          setShowData(false);
+          alert(importMode.current === "replace" ? "Data replaced from backup." : "Backup merged in.");
+        };
+        reader.readAsText(f);
+      };
+
+      // ── actions ──
+      const quickCapture = () => {
+        if (!capture.trim()) return;
+        upd({ ...items, inbox:[mk(capture), ...items.inbox] });
+        setCapture("");
+      };
+
+      const addItem = () => {
+        if (!form.title.trim()) return;
+        const item = { ...mk(form.title), context:form.context, dueDate:form.dueDate, waitingFor:form.waitingFor };
+        upd({ ...items, [active]:[item,...items[active]] });
+        setForm({title:"",context:"@anywhere",dueDate:"",waitingFor:""}); setShowForm(false);
+      };
+
+      const move = (from, id, to, patch={}) => {
+        const item = items[from].find(i=>i.id===id); if (!item) return;
+        upd({ ...items, [from]:items[from].filter(i=>i.id!==id), [to]:[{...item,...patch},...items[to]] });
+        setProcItem(null);
+      };
+
+      const del = (list, id) => upd({ ...items, [list]:items[list].filter(i=>i.id!==id) });
+
+      const handleStalledDecision = (decision, proj, extra) => {
+        let n = { ...items };
+        if (decision==="next" && extra) {
+          const a = { ...mk(`[${proj.title}] ${extra.title}`), context:extra.context, dueDate:extra.dueDate };
+          n = { ...n, next:[a,...n.next] };
+        }
+        if (decision==="waiting" && extra) {
+          const w = { ...mk(`[${proj.title}] ${extra.waitingFor}`), waitingFor:extra.waitingFor };
+          n = { ...n, waiting:[w,...n.waiting], projects:n.projects.filter(p=>p.id!==proj.id) };
+        }
+        if (decision==="someday")
+          n = { ...n, projects:n.projects.filter(p=>p.id!==proj.id), someday:[proj,...n.someday] };
+        if (decision==="close")
+          n = { ...n, projects:n.projects.filter(p=>p.id!==proj.id), done:[{...proj,doneAt:ts()},...n.done] };
+        upd(n);
+      };
+
+      const confirmComplete = (list, id, decision, nextAct) => {
+        const item = items[list].find(i=>i.id===id); if (!item) return;
+        const pname = exProj(item.title);
+        let n = { ...items, [list]:items[list].filter(i=>i.id!==id), done:[{...item,doneAt:ts()},...items.done] };
+        if (decision==="next" && nextAct) n = { ...n, next:[nextAct,...n.next] };
+        if (decision==="close" && pname) {
+          const p = n.projects.find(p=>p.title.toLowerCase()===pname.toLowerCase());
+          if (p) n = { ...n, projects:n.projects.filter(x=>x.id!==p.id), done:[{...p,doneAt:ts()},...n.done] };
+        }
+        if (decision==="waiting" && nextAct && pname) {
+          const waitItem = { ...mk(`[${pname}] ${nextAct.waitingFor}`), waitingFor:nextAct.waitingFor };
+          n = { ...n, waiting:[waitItem,...n.waiting] };
+        }
+        if (decision==="someday" && pname) {
+          const p = n.projects.find(p=>p.title.toLowerCase()===pname.toLowerCase());
+          if (p) n = { ...n, projects:n.projects.filter(x=>x.id!==p.id), someday:[p,...n.someday] };
+          n = { ...n, next:n.next.filter(a=>exProj(a.title)!==pname) };
+        }
+        upd(n); setComplCand(null);
+      };
+
+      if (!items) return (
+        <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",color:"#64748b",fontSize:14}}>
+          Loading…
+        </div>
+      );
+
+      const raw   = items[active] || [];
+      const shown = active==="next" && ctx!=="all" ? raw.filter(i=>i.context===ctx) : raw;
+      const counts = Object.fromEntries(LISTS.map(l=>[l,(items[l]||[]).length]));
+      const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+      const todayDone  = (items.done||[]).filter(i=>new Date(i.doneAt||i.created)>=todayStart).length;
+      const projActions = {};
+      (items.next||[]).forEach(a=>{ const p=exProj(a.title); if(p) (projActions[p]=projActions[p]||[]).push(a); });
+
+      // cloud sync status (syncTick forces this to re-evaluate after each sync)
+      void syncTick;
+      const odReady   = Drive.available();
+      const odOn      = odReady && Drive.enabled() && !!odAccount;
+      const syncLabel = !odReady   ? null
+                      : !odOn      ? "☁ Connect OneDrive"
+                      : syncing    ? "☁ Syncing…"
+                      : (typeof navigator!=="undefined" && navigator.onLine===false) ? "☁ Offline"
+                      : lastSyncRef.current ? `☁ Synced ${relTime(lastSyncRef.current)}` : "☁ Connected";
+
+      return (
+        <div style={{display:"flex",height:"100vh",fontFamily:"'Inter',system-ui,sans-serif",background:"#f1f5f9",color:"#1e293b",overflow:"hidden"}}>
+
+          {/* ── Sidebar ── */}
+          <aside style={{width:210,background:"#0f172a",display:"flex",flexDirection:"column",flexShrink:0,overflowY:"auto"}}>
+            <div style={{padding:"18px 16px 12px",borderBottom:"1px solid rgba(255,255,255,.06)"}}>
+              <div style={{fontWeight:800,fontSize:15,color:"#f1f5f9",letterSpacing:"-.3px"}}>GTD System</div>
+              <div style={{fontSize:10,color:"#475569",marginTop:2}}>David Allen methodology</div>
+            </div>
+            <div style={{padding:"10px 12px",borderBottom:"1px solid rgba(255,255,255,.06)"}}>
+              <div style={{fontSize:9,color:"#475569",textTransform:"uppercase",letterSpacing:"1px",marginBottom:5}}>Quick Capture</div>
+              <div style={{display:"flex",gap:5}}>
+                <input value={capture} onChange={e=>setCapture(e.target.value)}
+                  onKeyDown={e=>e.key==="Enter"&&quickCapture()} placeholder="Capture a thought…"
+                  style={{flex:1,padding:"6px 8px",background:"rgba(255,255,255,.07)",border:"1px solid rgba(255,255,255,.1)",borderRadius:6,color:"#f1f5f9",fontSize:11,outline:"none"}}/>
+                <button onClick={quickCapture}
+                  style={{padding:"6px 9px",background:"#6366f1",border:"none",borderRadius:6,color:"#fff",cursor:"pointer",fontWeight:700,fontSize:14,lineHeight:1}}>+</button>
+              </div>
+            </div>
+            <nav style={{flex:1,padding:"6px 8px"}}>
+              {LISTS.map(l => {
+                const m=META[l], on=active===l;
+                return (
+                  <button key={l} onClick={()=>{setActive(l);setCtx("all");setShowForm(false);}}
+                    style={{display:"flex",alignItems:"center",justifyContent:"space-between",width:"100%",padding:"8px 10px",background:on?"rgba(99,102,241,.18)":"transparent",border:"none",borderRadius:7,cursor:"pointer",color:on?"#a5b4fc":"#64748b",fontSize:12,fontWeight:on?600:400,textAlign:"left",marginBottom:1}}>
+                    <span>{m.icon} {m.label}</span>
+                    {(l==="done" ? todayDone : counts[l]) > 0 && (
+                      <span style={{background:l==="inbox"?"#ef4444":l==="done"?"#10b981":"#1e293b",color:"#fff",fontSize:9,padding:"1px 6px",borderRadius:20,fontWeight:700}}>
+                        {l==="done" ? todayDone : counts[l]}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </nav>
+            <div style={{padding:"8px 10px",borderTop:"1px solid rgba(255,255,255,.06)"}}>
+              <button onClick={()=>setShowData(true)}
+                style={{display:"flex",alignItems:"center",gap:7,width:"100%",padding:"8px 10px",background:"transparent",border:"1px solid rgba(255,255,255,.1)",borderRadius:7,color:"#64748b",cursor:"pointer",fontSize:11,fontWeight:600,textAlign:"left"}}
+                onMouseEnter={e=>e.currentTarget.style.color="#a5b4fc"}
+                onMouseLeave={e=>e.currentTarget.style.color="#64748b"}>
+                ⇅ Sync &amp; Backup
+              </button>
+              {syncLabel && (
+                <button onClick={()=>setShowData(true)}
+                  style={{display:"block",width:"100%",marginTop:5,padding:"0 2px",background:"none",border:"none",color:odOn?"#475569":"#6366f1",cursor:"pointer",fontSize:10,textAlign:"left"}}>
+                  {syncLabel}
+                </button>
+              )}
+            </div>
+            <div style={{padding:"8px 16px",fontSize:9,color:"#1e293b",borderTop:"1px solid rgba(255,255,255,.04)"}}>
+              Capture → Clarify → Organize → Reflect → Engage
+            </div>
+          </aside>
+
+          {/* ── Main ── */}
+          <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+            <div style={{padding:"14px 22px",background:"#fff",borderBottom:"1px solid #e2e8f0",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}}>
+              <div>
+                <div style={{fontSize:17,fontWeight:700}}>{META[active].icon} {META[active].label}</div>
+                <div style={{fontSize:11,color:"#64748b",marginTop:1}}>{META[active].hint}</div>
+              </div>
+              <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                {history.length > 0 && (
+                  <button onClick={undo} title="Undo (Ctrl+Z)"
+                    style={{padding:"7px 12px",background:"#fff",color:"#475569",border:"1px solid #e2e8f0",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:500}}>
+                    ↩ Undo
+                  </button>
+                )}
+                {active!=="done" && (
+                  <button onClick={()=>setShowForm(s=>!s)}
+                    style={{padding:"7px 14px",background:"#6366f1",color:"#fff",border:"none",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:600}}>
+                    {showForm?"Cancel":"+ Add"}
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {active==="next" && (
+              <div style={{padding:"8px 22px",background:"#fff",borderBottom:"1px solid #e2e8f0",display:"flex",gap:5,flexWrap:"wrap",flexShrink:0}}>
+                {["all",...CONTEXTS].map(c=>(
+                  <button key={c} onClick={()=>setCtx(c)}
+                    style={{padding:"3px 10px",borderRadius:20,border:`1px solid ${ctx===c?"#6366f1":"#e2e8f0"}`,background:ctx===c?"#6366f1":"#fff",color:ctx===c?"#fff":"#64748b",cursor:"pointer",fontSize:11,fontWeight:ctx===c?600:400}}>
+                    {c==="all"?"All":c}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {showForm && active!=="done" && (
+              <div style={{padding:"10px 22px",background:"#fafaf9",borderBottom:"1px solid #e2e8f0",flexShrink:0}}>
+                <div style={{display:"flex",gap:7,flexWrap:"wrap",alignItems:"flex-end"}}>
+                  <input autoFocus value={form.title} onChange={e=>setForm({...form,title:e.target.value})}
+                    onKeyDown={e=>e.key==="Enter"&&addItem()} placeholder={placeFor(active)}
+                    style={{flex:"1 1 200px",padding:"7px 10px",border:"1px solid #d1d5db",borderRadius:7,fontSize:13,outline:"none"}}/>
+                  {active==="next" && (
+                    <select value={form.context} onChange={e=>setForm({...form,context:e.target.value})}
+                      style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff"}}>
+                      {CONTEXTS.map(c=><option key={c}>{c}</option>)}
+                    </select>
+                  )}
+                  {active==="waiting" && (
+                    <input value={form.waitingFor} onChange={e=>setForm({...form,waitingFor:e.target.value})}
+                      placeholder="From whom?"
+                      style={{flex:"1 1 130px",padding:"7px 10px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,outline:"none"}}/>
+                  )}
+                  {["next","projects","waiting"].includes(active) && (
+                    <input type="date" value={form.dueDate} onChange={e=>setForm({...form,dueDate:e.target.value})}
+                      style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+                  )}
+                  <button onClick={addItem}
+                    style={{padding:"7px 16px",background:"#6366f1",color:"#fff",border:"none",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:600}}>
+                    Add
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div style={{flex:1,overflowY:"auto",padding:"14px 22px"}}>
+              {active==="projects" ? (
+                shown.length===0
+                  ? <EmptyState list="projects"/>
+                  : shown.map(p=>(
+                      <ProjCard key={p.id} proj={p} actions={projActions[p.title]||[]}
+                        onDelete={()=>del("projects",p.id)}
+                        onCompleteAction={id=>setComplCand({list:"next",item:(items.next||[]).find(i=>i.id===id)})}
+                        onDeleteAction={id=>del("next",id)}
+                        onStalledDecision={handleStalledDecision}/>
+                    ))
+              ) : active==="done" ? (
+                <DoneView items={shown} move={move} del={del}/>
+              ) : active==="inbox" ? (
+                shown.length===0
+                  ? <EmptyState list="inbox"/>
+                  : <InboxFocus item={shown[shown.length-1]} total={shown.length}
+                      onProcess={()=>setProcItem(shown[shown.length-1])}/>
+              ) : shown.length===0 ? (
+                <EmptyState list={active} ctx={ctx}/>
+              ) : (
+                <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                  {shown.map(item=>(
+                    <ItemCard key={item.id} item={item} list={active}
+                      onComplete={()=>setComplCand({list:active,item})}
+                      onDelete={()=>del(active,item.id)}
+                      onProcess={null}
+                      onRestore={active==="done"?()=>move("done",item.id,"next",{doneAt:undefined}):null}
+                      onMove={["next","waiting","someday","projects","reference"].includes(active)
+                        ? to=>upd({...items,[active]:items[active].filter(i=>i.id!==item.id),[to]:[item,...(items[to]||[])]})
+                        : null}
+                      currentList={active}/>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* hidden picker used by both Import buttons */}
+          <input ref={fileInputRef} type="file" accept="application/json,.json"
+            onChange={onImportFile} style={{display:"none"}}/>
+
+          {showData && (
+            <DataModal counts={counts}
+              onExport={()=>exportData(items)}
+              onImport={triggerImport}
+              cloud={{
+                ready: odReady, configured: !!MS_CLIENT_ID,
+                account: odAccount, syncing,
+                lastSynced: lastSyncRef.current,
+                onConnect: connectDrive, onDisconnect: disconnectDrive, onSyncNow: syncNow,
+              }}
+              onClose={()=>setShowData(false)}/>
+          )}
+
+          {complCand && complCand.item && (
+            <CompleteModal item={complCand.item} list={complCand.list}
+              projectItems={items.projects}
+              onConfirm={(d,a)=>confirmComplete(complCand.list,complCand.item.id,d,a)}
+              onClose={()=>setComplCand(null)}/>
+          )}
+          {procItem && (
+            <ProcessModal item={procItem}
+              onMove={(to,patch)=>move("inbox",procItem.id,to,patch)}
+              onMoveAsProject={(patch, first) => {
+                const src = items.inbox.find(i=>i.id===procItem.id); if (!src) return;
+                let n = {...items, inbox:items.inbox.filter(i=>i.id!==procItem.id), projects:[{...src,...patch},...items.projects]};
+                if (first.type==="next") {
+                  const a = {...mk(`[${src.title}] ${first.title}`), context:first.context, dueDate:first.dueDate};
+                  n = {...n, next:[a,...n.next]};
+                } else {
+                  const w = {...mk(`[${src.title}] ${first.waitingFor}`), waitingFor:first.waitingFor};
+                  n = {...n, waiting:[w,...n.waiting]};
+                }
+                upd(n); setProcItem(null);
+              }}
+              onTrash={()=>{del("inbox",procItem.id);setProcItem(null);}}
+              onClose={()=>setProcItem(null)}/>
+          )}
+        </div>
+      );
+    }
+
+    // ── DoneView / DoneGroup ──────────────────────────────────────
+    function DoneView({ items, move, del }) {
+      const [groupBy, setGroupBy] = useState("time");
+      if (items.length === 0) return <EmptyState list="done"/>;
+      const groups = groupBy==="time" ? doneByTime(items) : doneByProject(items);
+      return (
+        <div>
+          <div style={{display:"flex",gap:5,marginBottom:12}}>
+            {[["time","By date"],["project","By project"]].map(([g,lbl])=>(
+              <button key={g} onClick={()=>setGroupBy(g)}
+                style={{padding:"3px 10px",borderRadius:20,border:`1px solid ${groupBy===g?"#6366f1":"#e2e8f0"}`,
+                        background:groupBy===g?"#6366f1":"#fff",color:groupBy===g?"#fff":"#64748b",
+                        cursor:"pointer",fontSize:11,fontWeight:groupBy===g?600:400}}>
+                {lbl}
+              </button>
+            ))}
+          </div>
+          {groups.map(g=>(
+            <DoneGroup key={g.label} group={g}
+              onRestore={id=>move("done",id,"next",{doneAt:undefined})}
+              onDelete={id=>del("done",id)}/>
+          ))}
+        </div>
+      );
+    }
+
+    function DoneGroup({ group, onRestore, onDelete }) {
+      const [open, setOpen] = useState(group.defaultOpen);
+      return (
+        <div style={{marginBottom:8}}>
+          <button onClick={()=>setOpen(o=>!o)}
+            style={{display:"flex",alignItems:"center",gap:8,width:"100%",padding:"7px 12px",
+                    background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:8,
+                    cursor:"pointer",textAlign:"left",marginBottom:open?6:0}}>
+            <span style={{flex:1,fontSize:11,fontWeight:700,color:"#475569"}}>{group.label}</span>
+            <span style={{fontSize:10,color:"#94a3b8"}}>{group.items.length} item{group.items.length!==1?"s":""}</span>
+            <span style={{fontSize:9,color:"#94a3b8",display:"inline-block",transition:"transform .15s",transform:open?"rotate(180deg)":"none"}}>▼</span>
+          </button>
+          {open&&(
+            <div style={{display:"flex",flexDirection:"column",gap:5,paddingLeft:4}}>
+              {group.items.map(item=>(
+                <ItemCard key={item.id} item={item} list="done"
+                  onRestore={()=>onRestore(item.id)}
+                  onDelete={()=>onDelete(item.id)}/>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── ProjCard ──────────────────────────────────────────────────
+    function ProjCard({ proj, actions, onDelete, onCompleteAction, onDeleteAction, onStalledDecision }) {
+      const [open, setOpen]           = useState(false);
+      const [stalledPhase, setStalledPhase] = useState(null); // null | "define" | "waiting"
+      const [naTitle, setNaTitle]     = useState("");
+      const [naCtx,   setNaCtx]       = useState("@anywhere");
+      const [naDue,   setNaDue]       = useState("");
+      const [waitTxt, setWaitTxt]     = useState("");
+      const stalled = actions.length===0;
+
+      const resetStalled = () => { setStalledPhase(null); setNaTitle(""); setNaDue(""); setWaitTxt(""); };
+
+      return (
+        <div style={{border:`1px solid ${stalled?"#fcd34d":"#e2e8f0"}`,borderRadius:10,overflow:"hidden",marginBottom:8,background:"#fff"}}>
+          <div onClick={()=>setOpen(o=>!o)}
+            style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"11px 14px",background:stalled?"#fffbeb":"#f8fafc",cursor:"pointer",gap:10}}>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontWeight:600,fontSize:13,display:"flex",alignItems:"center",gap:7}}>
+                📋 {proj.title}
+                {stalled && <span style={{fontSize:10,background:"#fef9c3",color:"#92400e",padding:"1px 7px",borderRadius:20,fontWeight:700}}>⚠️ stalled</span>}
+              </div>
+              <div style={{fontSize:11,color:"#64748b",marginTop:2}}>{actions.length} active action{actions.length!==1?"s":""}</div>
+            </div>
+            <span style={{fontSize:11,color:"#94a3b8",transform:open?"rotate(180deg)":"none",transition:"transform .15s"}}>▼</span>
+          </div>
+          {open && (
+            <div style={{padding:"10px 14px",borderTop:"1px solid #e2e8f0"}}>
+              {stalled ? (
+                <div>
+                  <div style={{fontSize:11,color:"#92400e",background:"#fffbeb",padding:"7px 10px",borderRadius:7,marginBottom:10}}>
+                    No active next action — how do you want to handle this project?
+                  </div>
+
+                  {stalledPhase===null && (
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:8}}>
+                      <button onClick={()=>setStalledPhase("define")}
+                        style={{padding:"9px 10px",background:"#f5f3ff",border:"1.5px solid #6366f1",borderRadius:8,cursor:"pointer",fontSize:11,fontWeight:600,color:"#4338ca",textAlign:"left"}}>
+                        ⚡ Define next action
+                        <div style={{fontSize:10,fontWeight:400,color:"#6366f1",marginTop:1}}>Keep it moving</div>
+                      </button>
+                      <button onClick={()=>{ onStalledDecision("close",proj,null); }}
+                        style={{padding:"9px 10px",background:"#f0fdf4",border:"1.5px solid #10b981",borderRadius:8,cursor:"pointer",fontSize:11,fontWeight:600,color:"#065f46",textAlign:"left"}}>
+                        🎉 Mark complete
+                        <div style={{fontSize:10,fontWeight:400,color:"#10b981",marginTop:1}}>Outcome achieved</div>
+                      </button>
+                      <button onClick={()=>setStalledPhase("waiting")}
+                        style={{padding:"9px 10px",background:"#eff6ff",border:"1.5px solid #93c5fd",borderRadius:8,cursor:"pointer",fontSize:11,fontWeight:600,color:"#1e40af",textAlign:"left"}}>
+                        ⏳ Waiting for…
+                        <div style={{fontSize:10,fontWeight:400,color:"#3b82f6",marginTop:1}}>Ball is in someone else's court</div>
+                      </button>
+                      <button onClick={()=>{ onStalledDecision("someday",proj,null); }}
+                        style={{padding:"9px 10px",background:"#f8fafc",border:"1.5px solid #94a3b8",borderRadius:8,cursor:"pointer",fontSize:11,fontWeight:600,color:"#475569",textAlign:"left"}}>
+                        💤 Someday/Maybe
+                        <div style={{fontSize:10,fontWeight:400,color:"#64748b",marginTop:1}}>Not a priority now</div>
+                      </button>
+                    </div>
+                  )}
+
+                  {stalledPhase==="define" && (
+                    <div style={{background:"#f5f3ff",border:"1px solid #ddd6fe",borderRadius:8,padding:"10px 12px",marginBottom:8}}>
+                      <div style={{fontSize:11,fontWeight:600,color:"#4338ca",marginBottom:6}}>
+                        Next action for <em>{proj.title}</em>
+                      </div>
+                      <input autoFocus value={naTitle} onChange={e=>setNaTitle(e.target.value)}
+                        onKeyDown={e=>{ if(e.key==="Enter"&&naTitle.trim()){ onStalledDecision("next",proj,{title:naTitle.trim(),context:naCtx,dueDate:naDue}); resetStalled(); }}}
+                        placeholder="What is the very next physical action?"
+                        style={{width:"100%",padding:"7px 9px",border:"1px solid #c4b5fd",borderRadius:7,fontSize:12,outline:"none",marginBottom:6}}/>
+                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:8}}>
+                        <select value={naCtx} onChange={e=>setNaCtx(e.target.value)}
+                          style={{padding:"6px 8px",border:"1px solid #c4b5fd",borderRadius:7,fontSize:11,background:"#fff"}}>
+                          {CONTEXTS.map(c=><option key={c}>{c}</option>)}
+                        </select>
+                        <input type="date" value={naDue} onChange={e=>setNaDue(e.target.value)}
+                          style={{padding:"6px 8px",border:"1px solid #c4b5fd",borderRadius:7,fontSize:11}}/>
+                      </div>
+                      <div style={{display:"flex",gap:6}}>
+                        <button onClick={()=>{ if(naTitle.trim()){ onStalledDecision("next",proj,{title:naTitle.trim(),context:naCtx,dueDate:naDue}); resetStalled(); }}}
+                          disabled={!naTitle.trim()}
+                          style={{flex:1,padding:"7px",background:naTitle.trim()?"#6366f1":"#e2e8f0",color:naTitle.trim()?"#fff":"#94a3b8",border:"none",borderRadius:7,cursor:naTitle.trim()?"pointer":"default",fontSize:12,fontWeight:600}}>
+                          ✓ Add action
+                        </button>
+                        <button onClick={resetStalled}
+                          style={{padding:"7px 12px",background:"transparent",border:"1px solid #ddd6fe",borderRadius:7,cursor:"pointer",fontSize:12,color:"#6366f1"}}>
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {stalledPhase==="waiting" && (
+                    <div style={{background:"#eff6ff",border:"1px solid #bfdbfe",borderRadius:8,padding:"10px 12px",marginBottom:8}}>
+                      <div style={{fontSize:11,fontWeight:600,color:"#1e40af",marginBottom:6}}>
+                        What are you waiting for?
+                      </div>
+                      <input autoFocus value={waitTxt} onChange={e=>setWaitTxt(e.target.value)}
+                        onKeyDown={e=>{ if(e.key==="Enter"&&waitTxt.trim()){ onStalledDecision("waiting",proj,{waitingFor:waitTxt.trim()}); resetStalled(); }}}
+                        placeholder="e.g. John's approval on the proposal"
+                        style={{width:"100%",padding:"7px 9px",border:"1px solid #93c5fd",borderRadius:7,fontSize:12,outline:"none",marginBottom:8}}/>
+                      <div style={{display:"flex",gap:6}}>
+                        <button onClick={()=>{ if(waitTxt.trim()){ onStalledDecision("waiting",proj,{waitingFor:waitTxt.trim()}); resetStalled(); }}}
+                          disabled={!waitTxt.trim()}
+                          style={{flex:1,padding:"7px",background:waitTxt.trim()?"#3b82f6":"#e2e8f0",color:waitTxt.trim()?"#fff":"#94a3b8",border:"none",borderRadius:7,cursor:waitTxt.trim()?"pointer":"default",fontSize:12,fontWeight:600}}>
+                          ⏳ Add to Waiting For
+                        </button>
+                        <button onClick={resetStalled}
+                          style={{padding:"7px 12px",background:"transparent",border:"1px solid #bfdbfe",borderRadius:7,cursor:"pointer",fontSize:12,color:"#3b82f6"}}>
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div style={{display:"flex",flexDirection:"column",gap:5}}>
+                  {actions.map(a=>(
+                    <div key={a.id} style={{display:"flex",alignItems:"flex-start",gap:8,padding:"7px 8px",background:"#f8fafc",borderRadius:7,border:"1px solid #e2e8f0"}}>
+                      <button onClick={()=>onCompleteAction(a.id)}
+                        style={{width:17,height:17,borderRadius:"50%",border:"2px solid #cbd5e1",background:"#fff",cursor:"pointer",flexShrink:0,marginTop:1}}
+                        onMouseEnter={e=>e.target.style.borderColor="#6366f1"}
+                        onMouseLeave={e=>e.target.style.borderColor="#cbd5e1"}/>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:12,fontWeight:500,wordBreak:"break-word"}}>
+                          {a.title.replace(/^\[[^\]]+\]\s*/,"")}
+                        </div>
+                        <div style={{display:"flex",gap:5,marginTop:3,flexWrap:"wrap"}}>
+                          {a.context&&a.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{a.context}</Tag>}
+                          {a.dueDate&&<Tag bg={isOver(a.dueDate)?"#fef2f2":"#f0fdf4"} c={isOver(a.dueDate)?"#b91c1c":"#166534"}>{isOver(a.dueDate)?"⚠️ ":"📅 "}{a.dueDate}</Tag>}
+                        </div>
+                      </div>
+                      <button onClick={()=>onDeleteAction(a.id)}
+                        style={{background:"none",border:"none",cursor:"pointer",color:"#cbd5e1",fontSize:15,lineHeight:1}}
+                        onMouseEnter={e=>e.target.style.color="#ef4444"}
+                        onMouseLeave={e=>e.target.style.color="#cbd5e1"}>×</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <button onClick={onDelete}
+                style={{marginTop:10,width:"100%",padding:"6px",background:"transparent",border:"1px dashed #fca5a5",borderRadius:7,cursor:"pointer",fontSize:11,color:"#ef4444"}}>
+                Remove project
+              </button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── ItemCard ──────────────────────────────────────────────────
+    function ItemCard({ item, list, onComplete, onDelete, onProcess, onRestore, onMove, currentList }) {
+      const [showMove, setShowMove] = useState(false);
+      const moveRef = React.useRef(null);
+      useEffect(() => {
+        if (!showMove) return;
+        const close = e => { if (moveRef.current && !moveRef.current.contains(e.target)) setShowMove(false); };
+        document.addEventListener("mousedown", close);
+        return () => document.removeEventListener("mousedown", close);
+      }, [showMove]);
+      const ov = isOver(item.dueDate) && list!=="done";
+      const pname = exProj(item.title);
+      const displayTitle = list==="next" && pname ? item.title.replace(/^\[[^\]]+\]\s*/,"") : item.title;
+      const MOVE_TARGETS = { next:["waiting","someday","reference"], waiting:["next","someday"], someday:["next","waiting","projects"], projects:["next","waiting","someday"], reference:["next","someday"] };
+      const targets = onMove ? (MOVE_TARGETS[currentList]||[]) : [];
+      const targetLabel = { next:"Next Actions", waiting:"Waiting For", someday:"Someday/Maybe", projects:"Projects" };
+      return (
+        <div style={{background:"#fff",borderRadius:9,padding:"11px 14px",border:`1px solid ${ov?"#fca5a5":"#e2e8f0"}`,display:"flex",alignItems:"flex-start",gap:10,opacity:list==="done"?.55:1,position:"relative"}}>
+          {list!=="inbox"&&list!=="done"&&(
+            <button onClick={onComplete}
+              style={{width:18,height:18,borderRadius:"50%",border:"2px solid #cbd5e1",background:"#fff",cursor:"pointer",flexShrink:0,marginTop:2}}
+              onMouseEnter={e=>e.target.style.borderColor="#6366f1"}
+              onMouseLeave={e=>e.target.style.borderColor="#cbd5e1"}/>
+          )}
+          {list==="inbox"&&<div style={{width:18,flexShrink:0}}/>}
+          {list==="done"&&(
+            <div style={{width:18,height:18,borderRadius:"50%",background:"#6366f1",flexShrink:0,marginTop:2,display:"flex",alignItems:"center",justifyContent:"center"}}>
+              <span style={{color:"#fff",fontSize:9}}>✓</span>
+            </div>
+          )}
+          <div style={{flex:1,minWidth:0}}>
+            {pname&&list==="next"&&(
+              <div style={{fontSize:10,color:"#7c3aed",fontWeight:600,marginBottom:2}}>📋 {pname}</div>
+            )}
+            <div style={{fontSize:13,fontWeight:500,textDecoration:list==="done"?"line-through":"none",color:list==="done"?"#94a3b8":"#1e293b",wordBreak:"break-word"}}>
+              {displayTitle}
+            </div>
+            <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap"}}>
+              {item.context&&item.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{item.context}</Tag>}
+              {item.waitingFor&&<Tag bg="#fffbeb" c="#b45309">👤 {item.waitingFor}</Tag>}
+              {item.dueDate&&<Tag bg={ov?"#fef2f2":"#f0fdf4"} c={ov?"#b91c1c":"#166534"}>{ov?"⚠️ ":"📅 "}{item.dueDate}</Tag>}
+              {item.doneAt&&<Tag bg="#f0fdf4" c="#166534">✓ {fmtDate(item.doneAt)}</Tag>}
+            </div>
+          </div>
+          <div style={{display:"flex",gap:4,flexShrink:0,alignItems:"center"}}>
+            {onProcess&&<button onClick={onProcess} style={{padding:"3px 8px",background:"#6366f1",color:"#fff",border:"none",borderRadius:5,cursor:"pointer",fontSize:10,fontWeight:700}}>Process</button>}
+            {onRestore&&<button onClick={onRestore} style={{padding:"3px 8px",background:"#f1f5f9",color:"#475569",border:"1px solid #e2e8f0",borderRadius:5,cursor:"pointer",fontSize:10}}>Restore</button>}
+            {targets.length>0 && (
+              <div ref={moveRef} style={{position:"relative"}}>
+                <button onClick={()=>setShowMove(s=>!s)}
+                  style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:13,lineHeight:1,padding:"0 2px"}}
+                  title="Move to…">⇄</button>
+                {showMove && (
+                  <div style={{position:"absolute",right:0,top:"100%",marginTop:4,background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,boxShadow:"0 8px 24px rgba(0,0,0,.12)",zIndex:50,minWidth:140,overflow:"hidden"}}>
+                    <div style={{fontSize:9,color:"#94a3b8",fontWeight:700,textTransform:"uppercase",letterSpacing:".8px",padding:"7px 12px 4px"}}>Move to</div>
+                    {targets.map(t=>(
+                      <button key={t} onClick={()=>{onMove(t);setShowMove(false);}}
+                        style={{display:"block",width:"100%",padding:"7px 12px",background:"none",border:"none",cursor:"pointer",fontSize:12,textAlign:"left",color:"#1e293b"}}
+                        onMouseEnter={e=>e.currentTarget.style.background="#f1f5f9"}
+                        onMouseLeave={e=>e.currentTarget.style.background="none"}>
+                        {targetLabel[t]}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            <button onClick={onDelete}
+              style={{background:"none",border:"none",cursor:"pointer",color:"#cbd5e1",fontSize:16,lineHeight:1}}
+              onMouseEnter={e=>e.target.style.color="#ef4444"}
+              onMouseLeave={e=>e.target.style.color="#cbd5e1"}>×</button>
+          </div>
+        </div>
+      );
+    }
+
+    // ── CompleteModal ─────────────────────────────────────────────
+    function CompleteModal({ item, list, projectItems, onConfirm, onClose }) {
+      const pname = exProj(item.title);
+      const [phase, setPhase]         = useState(pname ? "decide" : "simple");
+      const [nextTitle, setNextTitle] = useState("");
+      const [nextCtx,   setNextCtx]   = useState(item.context||"@anywhere");
+      const [nextDue,   setNextDue]   = useState("");
+      const [waitingFor, setWaitingFor] = useState("");
+
+      const overlay = {position:"fixed",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200};
+      const box     = {background:"#fff",borderRadius:14,padding:22,width:420,maxWidth:"92vw",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
+
+      if (phase==="simple") return (
+        <div style={overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
+          <div style={box}>
+            <div style={{fontSize:14,fontWeight:700,marginBottom:5}}>Mark as done?</div>
+            <div style={{fontSize:12,color:"#64748b",marginBottom:16,fontStyle:"italic"}}>"{item.title}"</div>
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={()=>onConfirm("later",null)}
+                style={{flex:1,padding:"9px",background:"#10b981",color:"#fff",border:"none",borderRadius:8,cursor:"pointer",fontSize:13,fontWeight:600}}>✓ Done</button>
+              <button onClick={onClose}
+                style={{flex:1,padding:"9px",background:"transparent",border:"1px solid #e2e8f0",borderRadius:8,cursor:"pointer",fontSize:13,color:"#64748b"}}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      );
+
+      if (phase==="decide") return (
+        <div style={overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
+          <div style={box}>
+            <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>Action complete ✓</div>
+            <div style={{fontSize:12,color:"#64748b",marginBottom:12,fontStyle:"italic"}}>
+              "{item.title.replace(/^\[[^\]]+\]\s*/,"")}"
+            </div>
+            <div style={{background:"#f5f3ff",border:"1px solid #ddd6fe",borderRadius:8,padding:"8px 12px",marginBottom:14,fontSize:12,color:"#5b21b6"}}>
+              📋 <strong>{pname}</strong>
+              <div style={{marginTop:3,fontSize:11,color:"#7c3aed",fontStyle:"italic"}}>GTD: every project must always have a defined next action.</div>
+            </div>
+            <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",textTransform:"uppercase",letterSpacing:".8px",marginBottom:8}}>What's next for this project?</div>
+            <div style={{display:"flex",flexDirection:"column",gap:7}}>
+              <button onClick={()=>setPhase("define")}
+                style={{padding:"11px 13px",background:"#f5f3ff",border:"1.5px solid #6366f1",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:600,color:"#4338ca",textAlign:"left"}}>
+                ⚡ Define the next action now
+                <div style={{fontSize:10,fontWeight:400,color:"#6366f1",marginTop:2}}>Recommended — keeps the project moving</div>
+              </button>
+              <button onClick={()=>onConfirm("close",null)}
+                style={{padding:"11px 13px",background:"#f0fdf4",border:"1.5px solid #10b981",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:600,color:"#065f46",textAlign:"left"}}>
+                🎉 Project is complete — close it
+                <div style={{fontSize:10,fontWeight:400,color:"#10b981",marginTop:2}}>The outcome has been fully achieved</div>
+              </button>
+              <button onClick={()=>setPhase("waiting")}
+                style={{padding:"11px 13px",background:"#eff6ff",border:"1.5px solid #93c5fd",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:600,color:"#1e40af",textAlign:"left"}}>
+                ⏳ Waiting for someone/something
+                <div style={{fontSize:10,fontWeight:400,color:"#3b82f6",marginTop:2}}>The ball is in someone else's court</div>
+              </button>
+              <button onClick={()=>onConfirm("someday",null)}
+                style={{padding:"11px 13px",background:"#f8fafc",border:"1.5px solid #94a3b8",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:600,color:"#475569",textAlign:"left"}}>
+                💤 Move to Someday/Maybe
+                <div style={{fontSize:10,fontWeight:400,color:"#64748b",marginTop:2}}>Not a current priority — incubate it</div>
+              </button>
+              <button onClick={()=>onConfirm("later",null)}
+                style={{padding:"11px 13px",background:"#fffbeb",border:"1.5px solid #fcd34d",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:600,color:"#92400e",textAlign:"left"}}>
+                🔄 Decide at next Weekly Review
+                <div style={{fontSize:10,fontWeight:400,color:"#b45309",marginTop:2}}>⚠️ Project will appear as stalled until then</div>
+              </button>
+            </div>
+            <button onClick={onClose}
+              style={{marginTop:10,width:"100%",padding:"8px",background:"transparent",border:"1px solid #e2e8f0",borderRadius:8,cursor:"pointer",fontSize:12,color:"#64748b"}}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      );
+
+      if (phase==="define") return (
+        <div style={overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
+          <div style={box}>
+            <button onClick={()=>setPhase("decide")}
+              style={{background:"none",border:"none",cursor:"pointer",color:"#6366f1",fontSize:12,marginBottom:12,padding:0}}>← Back</button>
+            <div style={{fontSize:14,fontWeight:700,marginBottom:3}}>
+              Next action for: <span style={{color:"#6366f1"}}>{pname}</span>
+            </div>
+            <div style={{fontSize:11,color:"#64748b",marginBottom:12}}>
+              What is the very next <em>physical, visible</em> action?
+            </div>
+            <input autoFocus value={nextTitle} onChange={e=>setNextTitle(e.target.value)}
+              onKeyDown={e=>{ if(e.key==="Enter"&&nextTitle.trim()) onConfirm("next",{...mk(`[${pname}] ${nextTitle.trim()}`),context:nextCtx,dueDate:nextDue}); }}
+              placeholder="e.g. Gọi điện cho anh Sơn về tiến độ"
+              style={{width:"100%",padding:"8px 10px",border:"1px solid #d1d5db",borderRadius:8,fontSize:13,outline:"none",marginBottom:8}}/>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}}>
+              <div>
+                <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase",letterSpacing:".8px",marginBottom:4}}>Context</div>
+                <select value={nextCtx} onChange={e=>setNextCtx(e.target.value)}
+                  style={{width:"100%",padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff"}}>
+                  {CONTEXTS.map(c=><option key={c}>{c}</option>)}
+                </select>
+              </div>
+              <div>
+                <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase",letterSpacing:".8px",marginBottom:4}}>Due date</div>
+                <input type="date" value={nextDue} onChange={e=>setNextDue(e.target.value)}
+                  style={{width:"100%",padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+              </div>
+            </div>
+            <div style={{display:"flex",gap:8}}>
+              <button
+                onClick={()=>{ if(nextTitle.trim()) onConfirm("next",{...mk(`[${pname}] ${nextTitle.trim()}`),context:nextCtx,dueDate:nextDue}); }}
+                disabled={!nextTitle.trim()}
+                style={{flex:1,padding:"9px",background:nextTitle.trim()?"#6366f1":"#e2e8f0",color:nextTitle.trim()?"#fff":"#94a3b8",border:"none",borderRadius:8,cursor:nextTitle.trim()?"pointer":"default",fontSize:13,fontWeight:600}}>
+                ✓ Done & add next action
+              </button>
+              <button onClick={onClose}
+                style={{flex:1,padding:"9px",background:"transparent",border:"1px solid #e2e8f0",borderRadius:8,cursor:"pointer",fontSize:13,color:"#64748b"}}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+
+      if (phase==="waiting") return (
+        <div style={overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
+          <div style={box}>
+            <button onClick={()=>setPhase("decide")}
+              style={{background:"none",border:"none",cursor:"pointer",color:"#3b82f6",fontSize:12,marginBottom:12,padding:0}}>← Back</button>
+            <div style={{fontSize:14,fontWeight:700,marginBottom:3}}>
+              Waiting for: <span style={{color:"#3b82f6"}}>{pname}</span>
+            </div>
+            <div style={{fontSize:11,color:"#64748b",marginBottom:12}}>
+              What or who are you waiting for before this project can move forward?
+            </div>
+            <input autoFocus value={waitingFor} onChange={e=>setWaitingFor(e.target.value)}
+              onKeyDown={e=>{ if(e.key==="Enter"&&waitingFor.trim()) onConfirm("waiting",{waitingFor:waitingFor.trim()}); }}
+              placeholder="e.g. John's approval on the proposal"
+              style={{width:"100%",padding:"8px 10px",border:"1px solid #d1d5db",borderRadius:8,fontSize:13,outline:"none",marginBottom:14}}/>
+            <div style={{display:"flex",gap:8}}>
+              <button
+                onClick={()=>{ if(waitingFor.trim()) onConfirm("waiting",{waitingFor:waitingFor.trim()}); }}
+                disabled={!waitingFor.trim()}
+                style={{flex:1,padding:"9px",background:waitingFor.trim()?"#3b82f6":"#e2e8f0",color:waitingFor.trim()?"#fff":"#94a3b8",border:"none",borderRadius:8,cursor:waitingFor.trim()?"pointer":"default",fontSize:13,fontWeight:600}}>
+                ⏳ Add to Waiting For
+              </button>
+              <button onClick={onClose}
+                style={{flex:1,padding:"9px",background:"transparent",border:"1px solid #e2e8f0",borderRadius:8,cursor:"pointer",fontSize:13,color:"#64748b"}}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+
+      return null;
+    }
+
+    // ── InboxFocus ────────────────────────────────────────────────
+    function InboxFocus({ item, total, onProcess }) {
+      return (
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"48px 24px 24px"}}>
+          <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",textTransform:"uppercase",letterSpacing:"1px",marginBottom:28}}>
+            {total} item{total!==1?"s":""} to process
+          </div>
+          <div style={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:14,padding:"28px",width:"100%",maxWidth:520,boxShadow:"0 4px 24px rgba(0,0,0,.07)"}}>
+            <div style={{fontSize:10,color:"#94a3b8",textTransform:"uppercase",letterSpacing:".8px",marginBottom:10}}>Oldest item</div>
+            <div style={{fontSize:17,fontWeight:600,color:"#1e293b",lineHeight:1.45,marginBottom:24}}>{item.title}</div>
+            <div style={{background:"#f5f3ff",borderRadius:8,padding:"9px 12px",marginBottom:22,fontSize:11,color:"#6366f1",fontStyle:"italic"}}>
+              GTD: process top to bottom, oldest first. Make a decision on each item — never put it back.
+            </div>
+            <button onClick={onProcess}
+              style={{width:"100%",padding:"13px",background:"#6366f1",color:"#fff",border:"none",borderRadius:9,cursor:"pointer",fontSize:14,fontWeight:700}}>
+              Process this item →
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // ── ProcessModal ──────────────────────────────────────────────
+    function ProcessModal({ item, onMove, onMoveAsProject, onTrash, onClose }) {
+      const [ctx,       setCtx]       = useState("@anywhere");
+      const [due,       setDue]       = useState("");
+      const [from,      setFrom]      = useState("");
+      const [phase,     setPhase]     = useState("main"); // "main" | "project" | "doit"
+      const [firstType, setFirstType] = useState("next");
+      const [naTitle,   setNaTitle]   = useState("");
+      const [naCtx,     setNaCtx]     = useState("@anywhere");
+      const [naDue,     setNaDue]     = useState("");
+      const [waitTxt,   setWaitTxt]   = useState("");
+      const [secsLeft,  setSecsLeft]  = useState(120);
+
+      useEffect(() => {
+        if (phase !== "doit") return;
+        setSecsLeft(120);
+        const id = setInterval(() => setSecsLeft(s => Math.max(0, s - 1)), 1000);
+        return () => clearInterval(id);
+      }, [phase]);
+
+      const overlay = {position:"fixed",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200};
+      const box     = {background:"#fff",borderRadius:14,padding:22,width:420,maxWidth:"92vw",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
+
+      const Opt = ({ bg, border, color, onClick, children }) => (
+        <button onClick={onClick}
+          style={{padding:"9px 12px",background:bg,border:`1px solid ${border}`,borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:500,textAlign:"left",color,width:"100%"}}>
+          {children}
+        </button>
+      );
+
+      const Divider = ({label}) => (
+        <div style={{display:"flex",alignItems:"center",gap:8,margin:"12px 0 8px"}}>
+          <div style={{flex:1,height:1,background:"#e2e8f0"}}/>
+          <span style={{fontSize:9,fontWeight:700,color:"#94a3b8",textTransform:"uppercase",letterSpacing:".8px"}}>{label}</span>
+          <div style={{flex:1,height:1,background:"#e2e8f0"}}/>
+        </div>
+      );
+
+      const tabBtn = (label, active, onClick) => (
+        <button onClick={onClick}
+          style={{flex:1,padding:"8px",fontSize:12,fontWeight:600,border:`1.5px solid ${active?"#6366f1":"#e2e8f0"}`,borderRadius:7,cursor:"pointer",
+            background:active?"#6366f1":"#fff",color:active?"#fff":"#64748b"}}>
+          {label}
+        </button>
+      );
+
+      if (phase==="doit") {
+        const mins    = Math.floor(secsLeft / 60);
+        const secs    = secsLeft % 60;
+        const timeStr = `${mins}:${secs.toString().padStart(2,"0")}`;
+        const over    = secsLeft === 0;
+        return (
+          <div style={overlay}>
+            <div style={{...box, textAlign:"center"}}>
+              <div style={{fontSize:11,fontWeight:700,color:"#10b981",textTransform:"uppercase",letterSpacing:"1px",marginBottom:12}}>
+                Do it now
+              </div>
+              <div style={{fontSize:16,fontWeight:600,color:"#1e293b",lineHeight:1.4,marginBottom:20}}>
+                {item.title}
+              </div>
+              <div style={{fontSize:52,fontWeight:800,letterSpacing:"-2px",color:over?"#ef4444":secsLeft<=30?"#f59e0b":"#10b981",marginBottom:6,fontVariantNumeric:"tabular-nums"}}>
+                {timeStr}
+              </div>
+              <div style={{fontSize:11,color:"#94a3b8",marginBottom:24}}>
+                {over ? "Time's up — did you finish?" : "2-minute timer running…"}
+              </div>
+              <button onClick={()=>onMove("done",{doneAt:ts()})}
+                style={{width:"100%",padding:"13px",background:"#10b981",color:"#fff",border:"none",borderRadius:9,cursor:"pointer",fontSize:14,fontWeight:700,marginBottom:8}}>
+                ✓ Done — back to inbox
+              </button>
+              <button onClick={()=>setPhase("main")}
+                style={{width:"100%",padding:"9px",background:"transparent",border:"1px solid #e2e8f0",borderRadius:9,cursor:"pointer",fontSize:12,color:"#64748b"}}>
+                Takes longer — defer it instead
+              </button>
+            </div>
+          </div>
+        );
+      }
+
+      if (phase==="project") {
+        const canConfirm = firstType==="next" ? naTitle.trim() : waitTxt.trim();
+        const confirm = () => {
+          const first = firstType==="next"
+            ? {type:"next", title:naTitle.trim(), context:naCtx, dueDate:naDue}
+            : {type:"waiting", waitingFor:waitTxt.trim()};
+          onMoveAsProject({dueDate:due}, first);
+        };
+        return (
+          <div style={overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
+            <div style={box}>
+              <button onClick={()=>setPhase("main")}
+                style={{background:"none",border:"none",cursor:"pointer",color:"#6366f1",fontSize:12,marginBottom:12,padding:0}}>← Back</button>
+              <div style={{fontSize:14,fontWeight:700,marginBottom:3}}>New project: <span style={{color:"#6366f1"}}>{item.title}</span></div>
+              <div style={{fontSize:11,color:"#64748b",marginBottom:14}}>
+                GTD: every project needs a first next action or a waiting-for before it's active.
+              </div>
+              <div style={{display:"flex",gap:6,marginBottom:14}}>
+                {tabBtn("⚡ Next Action", firstType==="next", ()=>setFirstType("next"))}
+                {tabBtn("⏳ Waiting For", firstType==="waiting", ()=>setFirstType("waiting"))}
+              </div>
+              {firstType==="next" ? (
+                <div>
+                  <input autoFocus value={naTitle} onChange={e=>setNaTitle(e.target.value)}
+                    onKeyDown={e=>e.key==="Enter"&&canConfirm&&confirm()}
+                    placeholder="What is the very next physical action?"
+                    style={{width:"100%",padding:"8px 10px",border:"1px solid #d1d5db",borderRadius:8,fontSize:13,outline:"none",marginBottom:8}}/>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7,marginBottom:14}}>
+                    <select value={naCtx} onChange={e=>setNaCtx(e.target.value)}
+                      style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff"}}>
+                      {CONTEXTS.map(c=><option key={c}>{c}</option>)}
+                    </select>
+                    <input type="date" value={naDue} onChange={e=>setNaDue(e.target.value)}
+                      style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+                  </div>
+                </div>
+              ) : (
+                <input autoFocus value={waitTxt} onChange={e=>setWaitTxt(e.target.value)}
+                  onKeyDown={e=>e.key==="Enter"&&canConfirm&&confirm()}
+                  placeholder="Waiting for whom / what?"
+                  style={{width:"100%",padding:"8px 10px",border:"1px solid #d1d5db",borderRadius:8,fontSize:13,outline:"none",marginBottom:14}}/>
+              )}
+              <button onClick={confirm} disabled={!canConfirm}
+                style={{width:"100%",padding:"10px",background:canConfirm?"#6366f1":"#e2e8f0",color:canConfirm?"#fff":"#94a3b8",
+                  border:"none",borderRadius:8,cursor:canConfirm?"pointer":"default",fontSize:13,fontWeight:600}}>
+                ✓ Create project + add {firstType==="next"?"next action":"waiting for"}
+              </button>
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div style={overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
+          <div style={box}>
+            <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>Clarify this item</div>
+            <div style={{fontSize:12,color:"#64748b",marginBottom:2,fontStyle:"italic"}}>"{item.title}"</div>
+
+            <Divider label="Actionable"/>
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              <button onClick={()=>setPhase("doit")}
+                style={{padding:"9px 12px",background:"#ecfdf5",border:"1.5px solid #34d399",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:600,textAlign:"left",color:"#065f46",width:"100%"}}>
+                ✅ Do it now — under 2 minutes
+                <div style={{fontSize:10,fontWeight:400,color:"#10b981",marginTop:2}}>Starts a 2-min timer — mark done when finished</div>
+              </button>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7}}>
+                <select value={ctx} onChange={e=>setCtx(e.target.value)}
+                  style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff"}}>
+                  {CONTEXTS.map(c=><option key={c}>{c}</option>)}
+                </select>
+                <input type="date" value={due} onChange={e=>setDue(e.target.value)}
+                  style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+              </div>
+              <Opt bg="#f5f3ff" border="#c4b5fd" color="#5b21b6" onClick={()=>onMove("next",{context:ctx,dueDate:due})}>⚡ Next Action — you do it</Opt>
+              <Opt bg="#f5f3ff" border="#ddd6fe" color="#4338ca" onClick={()=>setPhase("project")}>📋 Project — multiple steps needed</Opt>
+              <input value={from} onChange={e=>setFrom(e.target.value)} placeholder="Waiting from whom?"
+                style={{padding:"7px 10px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,outline:"none"}}/>
+              <Opt bg="#fffbeb" border="#fde68a" color="#92400e" onClick={()=>onMove("waiting",{waitingFor:from,dueDate:due})}>⏳ Waiting For — someone else does it</Opt>
+            </div>
+
+            <Divider label="Not actionable"/>
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              <Opt bg="#f0fdf4" border="#86efac" color="#166534" onClick={()=>onMove("someday",{})}>🌟 Someday/Maybe — revisit when the time is right</Opt>
+              <Opt bg="#eff6ff" border="#93c5fd" color="#1e40af" onClick={()=>onMove("reference",{})}>📁 Reference — keep for future lookup</Opt>
+              <Opt bg="#f8fafc" border="#e2e8f0" color="#475569" onClick={onTrash}>🗑️ Trash — not needed</Opt>
+            </div>
+
+            <div style={{marginTop:10,fontSize:10,color:"#94a3b8",textAlign:"center",fontStyle:"italic"}}>
+              Click outside to come back to this item later.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── DataModal: cloud sync + offline export / import ──────────
+    function DataModal({ counts, onExport, onImport, cloud, onClose }) {
+      const total   = LISTS.reduce((n,l)=>n+(counts[l]||0),0);
+      const overlay = {position:"fixed",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200};
+      const box     = {background:"#fff",borderRadius:14,padding:22,width:420,maxWidth:"92vw",maxHeight:"92vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
+      const card    = (bg,border,color) => ({padding:"11px 13px",background:bg,border:`1.5px solid ${border}`,borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:600,color,textAlign:"left",width:"100%"});
+      const head    = {fontSize:10,fontWeight:700,color:"#94a3b8",textTransform:"uppercase",letterSpacing:".8px",marginBottom:8};
+      const c       = cloud || {};
+      return (
+        <div style={overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
+          <div style={box}>
+            <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>⇅ Sync &amp; Backup</div>
+            <div style={{fontSize:12,color:"#64748b",marginBottom:14,lineHeight:1.5}}>
+              Keep devices in sync via your own OneDrive, or move data manually with a file.
+              <strong> {total}</strong> item{total!==1?"s":""} on this device.
+            </div>
+
+            <div style={head}>Cloud sync — OneDrive</div>
+            {!c.configured ? (
+              <div style={{padding:"11px 13px",background:"#fffbeb",border:"1px solid #fde68a",borderRadius:8,fontSize:11,color:"#92400e",lineHeight:1.5,marginBottom:16}}>
+                Not set up yet. Register a free Azure app, paste its <strong>client ID</strong> into
+                <code style={{background:"#fef3c7",padding:"0 4px",borderRadius:3,margin:"0 2px"}}>MS_CLIENT_ID</code>
+                in <code style={{background:"#fef3c7",padding:"0 4px",borderRadius:3}}>index.html</code>, then reload.
+                See the README → “Cloud sync via OneDrive”.
+              </div>
+            ) : !c.account ? (
+              <button onClick={c.onConnect} style={{...card("#eff6ff","#3b82f6","#1e40af"),marginBottom:16}}>
+                ☁ Connect OneDrive
+                <div style={{fontSize:10,fontWeight:400,color:"#3b82f6",marginTop:2}}>Sign in with your Microsoft account — syncs every device, no server</div>
+              </button>
+            ) : (
+              <div style={{border:"1px solid #e2e8f0",borderRadius:8,padding:"11px 13px",marginBottom:16}}>
+                <div style={{fontSize:12,fontWeight:600,color:"#1e293b",marginBottom:2}}>☁ Connected</div>
+                <div style={{fontSize:11,color:"#64748b",marginBottom:2,wordBreak:"break-all"}}>{c.account.username||"OneDrive"}</div>
+                <div style={{fontSize:10,color:"#94a3b8",marginBottom:10}}>
+                  {c.syncing ? "Syncing…" : c.lastSynced ? `Last synced ${relTime(c.lastSynced)}` : "Not synced yet"}
+                </div>
+                <div style={{display:"flex",gap:7}}>
+                  <button onClick={c.onSyncNow} disabled={c.syncing}
+                    style={{flex:1,padding:"7px",background:c.syncing?"#e2e8f0":"#6366f1",color:c.syncing?"#94a3b8":"#fff",border:"none",borderRadius:7,cursor:c.syncing?"default":"pointer",fontSize:12,fontWeight:600}}>
+                    {c.syncing?"Syncing…":"↻ Sync now"}
+                  </button>
+                  <button onClick={c.onDisconnect}
+                    style={{padding:"7px 12px",background:"transparent",border:"1px solid #e2e8f0",borderRadius:7,cursor:"pointer",fontSize:12,color:"#64748b"}}>
+                    Disconnect
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div style={head}>Export</div>
+            <button onClick={onExport} style={{...card("#f5f3ff","#6366f1","#4338ca"),marginBottom:16}}>
+              💾 Save backup file
+              <div style={{fontSize:10,fontWeight:400,color:"#6366f1",marginTop:2}}>Downloads gtd-backup-….json (uses the share sheet on phones)</div>
+            </button>
+
+            <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",textTransform:"uppercase",letterSpacing:".8px",marginBottom:8}}>Import from a backup file</div>
+            <div style={{display:"flex",flexDirection:"column",gap:7}}>
+              <button onClick={()=>onImport("merge")} style={card("#f0fdf4","#10b981","#065f46")}>
+                ➕ Merge — keep both
+                <div style={{fontSize:10,fontWeight:400,color:"#10b981",marginTop:2}}>Adds the file's items to this device (same items aren't duplicated)</div>
+              </button>
+              <button onClick={()=>onImport("replace")} style={card("#fef2f2","#fca5a5","#b91c1c")}>
+                ♻️ Replace — overwrite this device
+                <div style={{fontSize:10,fontWeight:400,color:"#ef4444",marginTop:2}}>Discards what's here and loads the file exactly</div>
+              </button>
+            </div>
+
+            <button onClick={onClose}
+              style={{marginTop:14,width:"100%",padding:"8px",background:"transparent",border:"1px solid #e2e8f0",borderRadius:8,cursor:"pointer",fontSize:12,color:"#64748b"}}>
+              Close
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // ── Misc ──────────────────────────────────────────────────────
+    const Tag = ({ bg, c, children }) => (
+      <span style={{background:bg,color:c,fontSize:10,padding:"2px 7px",borderRadius:20,fontWeight:500}}>{children}</span>
+    );
+
+    function EmptyState({ list, ctx }) {
+      const m = {
+        inbox:     ["📥","Inbox zero!","Use Quick Capture to add items."],
+        next:      ["⚡","Clear horizons.","No next actions — process your inbox."],
+        projects:  ["📋","No projects yet.","Add outcomes needing more than one step."],
+        waiting:   ["⏳","Nothing waiting.","Track items you've delegated to others."],
+        someday:   ["🌟","Dream big.","Capture ideas to revisit someday."],
+        reference: ["📁","No reference material.","Store non-actionable items you want to keep."],
+        done:      ["🎉","Nothing completed yet.","Mark items done and they'll appear here."],
+      };
+      const [icon,title,sub] = m[list]||["✨","Empty",""];
+      return (
+        <div style={{textAlign:"center",padding:"52px 20px",color:"#94a3b8"}}>
+          <div style={{fontSize:38,marginBottom:10}}>{icon}</div>
+          <div style={{fontSize:14,fontWeight:600,color:"#475569"}}>{title}</div>
+          <div style={{fontSize:12,marginTop:4}}>
+            {list==="next"&&ctx!=="all" ? `No actions in ${ctx}.` : sub}
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+
+  <!-- Register service worker so the app installs and runs fully offline -->
+  <script>
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("sw.js").catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>

@@ -18,8 +18,9 @@
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <!-- Microsoft Authentication Library — used only for the OPTIONAL OneDrive cloud sync -->
-  <script src="https://alcdn.msauthcdn.com/lib/2.x/js/msal-browser.min.js"></script>
+  <!-- Microsoft Authentication Library — used only for the OPTIONAL OneDrive cloud sync.
+       Served from unpkg (same CDN as React) — Microsoft's own alcdn host is unreliable. -->
+  <script src="https://unpkg.com/@azure/msal-browser@2.38.4/lib/msal-browser.min.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { margin: 0; }
@@ -305,8 +306,20 @@
       // keep a ref of the latest items for async sync callbacks (avoids stale closures)
       useEffect(() => { itemsRef.current = items; }, [items]);
 
-      // process any pending MSAL redirect response once on load (no-op for popup flow)
-      useEffect(() => { const m = Drive.init(); if (m) m.handleRedirectPromise().catch(() => {}); }, []);
+      // process any pending MSAL redirect response once on load (no-op for popup flow).
+      // If we returned from a loginRedirect fallback, finish the connection here.
+      useEffect(() => {
+        const m = Drive.init(); if (!m) return;
+        m.handleRedirectPromise().then(res => {
+          if (res && res.account) {
+            m.setActiveAccount(res.account);
+            try { localStorage.setItem(OD_FLAG, "1"); } catch {}
+            setOdAccount(Drive.account());
+            syncNow();
+          }
+        }).catch(() => {});
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, []);   // mount-only; syncNow is stable (useCallback) and only read inside .then after mount
 
       // ── offline-first load: show local immediately, then reconcile with the
       //    optional remotes (Flask hub + OneDrive) by last-write-wins on
@@ -384,8 +397,23 @@
       }, []);
 
       const connectDrive = useCallback(async () => {
-        try { const a = await Drive.connect(); setOdAccount(a); if (a) await syncNow(); }
-        catch { alert("Could not connect to OneDrive — check your client ID / app registration."); }
+        if (typeof msal === "undefined") {        // MSAL CDN didn't load — don't fail silently
+          alert("The Microsoft sign-in library couldn't load (network or content blocker). Check your connection and reload, then try again.");
+          return;
+        }
+        try {
+          const a = await Drive.connect();
+          setOdAccount(a);
+          if (a) await syncNow();
+          else alert("Sign-in didn't complete — the popup may have been blocked. Allow popups for this site and try again.");
+        } catch (err) {
+          const code = err && (err.errorCode || err.name) || "";
+          if (/popup/i.test(code) || /popup/i.test(err && err.message || "")) {
+            try { Drive.init(); Drive._msal.loginRedirect({ scopes: MS_SCOPES }); return; }  // fall back to full-page redirect
+            catch {}
+          }
+          alert("Could not connect to OneDrive: " + (err && err.message ? err.message : "check your client ID / app registration / redirect URI."));
+        }
       }, [syncNow]);
 
       const disconnectDrive = useCallback(async () => {

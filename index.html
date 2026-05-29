@@ -283,6 +283,7 @@
       const [form, setForm]               = useState({title:"",context:"@anywhere",dueDate:"",waitingFor:""});
       const [procItem, setProcItem]       = useState(null);
       const [complCand, setComplCand]     = useState(null);
+      const [promoteCand, setPromoteCand] = useState(null);  // next action → project
       const [history,  setHistory]        = useState([]);
       const [showData, setShowData]       = useState(false);
       const [navOpen,  setNavOpen]        = useState(false);  // mobile drawer
@@ -703,6 +704,7 @@
                       onMove={["next","waiting","someday","projects","reference"].includes(active)
                         ? to=>upd({...items,[active]:items[active].filter(i=>i.id!==item.id),[to]:[item,...(items[to]||[])]})
                         : null}
+                      onPromote={active==="next" ? ()=>setPromoteCand(item) : null}
                       currentList={active}/>
                   ))}
                 </div>
@@ -732,6 +734,22 @@
               projectItems={items.projects}
               onConfirm={(d,a)=>confirmComplete(complCand.list,complCand.item.id,d,a)}
               onClose={()=>setComplCand(null)}/>
+          )}
+
+          {promoteCand && (
+            <PromoteModal item={promoteCand}
+              onConfirm={outcome=>{
+                const actionText = promoteCand.title.replace(/^\[[^\]]+\]\s*/,"");
+                const proj = {...mk(outcome), dueDate:promoteCand.dueDate||""};
+                const linked = {...promoteCand, title:`[${outcome}] ${actionText}`};
+                upd({
+                  ...items,
+                  next: items.next.map(a=>a.id===promoteCand.id?linked:a),
+                  projects: [proj, ...items.projects],
+                });
+                setPromoteCand(null);
+              }}
+              onClose={()=>setPromoteCand(null)}/>
           )}
           {procItem && (
             <ProcessModal item={procItem}
@@ -954,21 +972,45 @@
     }
 
     // ── ItemCard ──────────────────────────────────────────────────
-    function ItemCard({ item, list, onComplete, onDelete, onProcess, onRestore, onMove, currentList }) {
-      const [showMove, setShowMove] = useState(false);
+    function ItemCard({ item, list, onComplete, onDelete, onProcess, onRestore, onMove, onPromote, currentList }) {
+      const [menuPos, setMenuPos] = useState(null);   // {top|bottom, right} in viewport coords, or null = closed
       const moveRef = React.useRef(null);
+      const btnRef  = React.useRef(null);
+      const menuRef = React.useRef(null);
+      const showMove = !!menuPos;
+      // The list area is an overflow:auto scroll container that would clip an
+      // in-flow menu. Render it through a portal into <body> with position:fixed
+      // (escapes every overflow/transform ancestor) and flip it up near the bottom.
+      const openMenu = () => {
+        const r = btnRef.current.getBoundingClientRect();
+        const right = window.innerWidth - r.right;
+        const below = window.innerHeight - r.bottom;
+        if (below < 220) setMenuPos({ bottom: window.innerHeight - r.top + 4, right });
+        else             setMenuPos({ top: r.bottom + 4, right });
+      };
       useEffect(() => {
         if (!showMove) return;
-        const close = e => { if (moveRef.current && !moveRef.current.contains(e.target)) setShowMove(false); };
+        const close = e => {
+          if (moveRef.current && moveRef.current.contains(e.target)) return;
+          if (menuRef.current && menuRef.current.contains(e.target)) return;
+          setMenuPos(null);
+        };
+        const dismiss = () => setMenuPos(null);
         document.addEventListener("mousedown", close);
-        return () => document.removeEventListener("mousedown", close);
+        window.addEventListener("scroll", dismiss, true);   // capture: any ancestor scroll closes it
+        window.addEventListener("resize", dismiss);
+        return () => {
+          document.removeEventListener("mousedown", close);
+          window.removeEventListener("scroll", dismiss, true);
+          window.removeEventListener("resize", dismiss);
+        };
       }, [showMove]);
       const ov = isOver(item.dueDate) && list!=="done";
       const pname = exProj(item.title);
       const displayTitle = list==="next" && pname ? item.title.replace(/^\[[^\]]+\]\s*/,"") : item.title;
       const MOVE_TARGETS = { next:["waiting","someday","reference"], waiting:["next","someday"], someday:["next","waiting","projects"], projects:["next","waiting","someday"], reference:["next","someday"] };
       const targets = onMove ? (MOVE_TARGETS[currentList]||[]) : [];
-      const targetLabel = { next:"Next Actions", waiting:"Waiting For", someday:"Someday/Maybe", projects:"Projects" };
+      const targetLabel = { next:"Next Actions", waiting:"Waiting For", someday:"Someday/Maybe", projects:"Projects", reference:"Reference" };
       return (
         <div style={{background:"#fff",borderRadius:9,padding:"11px 14px",border:`1px solid ${ov?"#fca5a5":"#e2e8f0"}`,display:"flex",alignItems:"flex-start",gap:10,opacity:list==="done"?.55:1,position:"relative"}}>
           {list!=="inbox"&&list!=="done"&&(
@@ -1000,23 +1042,39 @@
           <div style={{display:"flex",gap:4,flexShrink:0,alignItems:"center"}}>
             {onProcess&&<button onClick={onProcess} style={{padding:"3px 8px",background:"#6366f1",color:"#fff",border:"none",borderRadius:5,cursor:"pointer",fontSize:10,fontWeight:700}}>Process</button>}
             {onRestore&&<button onClick={onRestore} style={{padding:"3px 8px",background:"#f1f5f9",color:"#475569",border:"1px solid #e2e8f0",borderRadius:5,cursor:"pointer",fontSize:10}}>Restore</button>}
-            {targets.length>0 && (
+            {(targets.length>0 || onPromote) && (
               <div ref={moveRef} style={{position:"relative"}}>
-                <button onClick={()=>setShowMove(s=>!s)}
+                <button ref={btnRef} onClick={()=>showMove?setMenuPos(null):openMenu()}
                   style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:13,lineHeight:1,padding:"0 2px"}}
                   title="Move to…">⇄</button>
-                {showMove && (
-                  <div style={{position:"absolute",right:0,top:"100%",marginTop:4,background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,boxShadow:"0 8px 24px rgba(0,0,0,.12)",zIndex:50,minWidth:140,overflow:"hidden"}}>
-                    <div style={{fontSize:9,color:"#94a3b8",fontWeight:700,textTransform:"uppercase",letterSpacing:".8px",padding:"7px 12px 4px"}}>Move to</div>
-                    {targets.map(t=>(
-                      <button key={t} onClick={()=>{onMove(t);setShowMove(false);}}
-                        style={{display:"block",width:"100%",padding:"7px 12px",background:"none",border:"none",cursor:"pointer",fontSize:12,textAlign:"left",color:"#1e293b"}}
-                        onMouseEnter={e=>e.currentTarget.style.background="#f1f5f9"}
-                        onMouseLeave={e=>e.currentTarget.style.background="none"}>
-                        {targetLabel[t]}
-                      </button>
-                    ))}
-                  </div>
+                {showMove && ReactDOM.createPortal(
+                  <div ref={menuRef} style={{position:"fixed",top:menuPos.top,bottom:menuPos.bottom,right:menuPos.right,background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,boxShadow:"0 8px 24px rgba(0,0,0,.12)",zIndex:300,minWidth:160,overflow:"hidden"}}>
+                    {targets.length>0 && (
+                      <React.Fragment>
+                        <div style={{fontSize:9,color:"#94a3b8",fontWeight:700,textTransform:"uppercase",letterSpacing:".8px",padding:"7px 12px 4px"}}>Move to</div>
+                        {targets.map(t=>(
+                          <button key={t} onClick={()=>{onMove(t);setMenuPos(null);}}
+                            style={{display:"block",width:"100%",padding:"7px 12px",background:"none",border:"none",cursor:"pointer",fontSize:12,textAlign:"left",color:"#1e293b"}}
+                            onMouseEnter={e=>e.currentTarget.style.background="#f1f5f9"}
+                            onMouseLeave={e=>e.currentTarget.style.background="none"}>
+                            {targetLabel[t]}
+                          </button>
+                        ))}
+                      </React.Fragment>
+                    )}
+                    {onPromote && (
+                      <React.Fragment>
+                        {targets.length>0 && <div style={{height:1,background:"#f1f5f9",margin:"3px 0"}}/>}
+                        <button onClick={()=>{onPromote();setMenuPos(null);}}
+                          style={{display:"block",width:"100%",padding:"7px 12px",background:"none",border:"none",cursor:"pointer",fontSize:12,textAlign:"left",color:"#4338ca",fontWeight:600}}
+                          onMouseEnter={e=>e.currentTarget.style.background="#f5f3ff"}
+                          onMouseLeave={e=>e.currentTarget.style.background="none"}>
+                          📋 Make into project
+                        </button>
+                      </React.Fragment>
+                    )}
+                  </div>,
+                  document.body
                 )}
               </div>
             )}
@@ -1180,6 +1238,46 @@
       );
 
       return null;
+    }
+
+    // ── PromoteModal — turn a single next action into a project ───
+    function PromoteModal({ item, onConfirm, onClose }) {
+      const actionText = item.title.replace(/^\[[^\]]+\]\s*/,"");
+      const [outcome, setOutcome] = useState("");
+      const can = outcome.trim();
+      const confirm = () => { if (can) onConfirm(outcome.trim()); };
+      const overlay = {position:"fixed",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200};
+      const box     = {background:"#fff",borderRadius:14,padding:22,width:420,maxWidth:"92vw",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
+      return (
+        <div style={overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
+          <div style={box}>
+            <div style={{fontSize:14,fontWeight:700,marginBottom:3}}>Make into a project</div>
+            <div style={{fontSize:11,color:"#64748b",marginBottom:14}}>
+              GTD: a project is a multi-step outcome. This action stays on as its first next action.
+            </div>
+            <div style={{background:"#f5f3ff",border:"1px solid #ddd6fe",borderRadius:8,padding:"8px 12px",marginBottom:14,fontSize:12,color:"#5b21b6"}}>
+              ⚡ <strong>{actionText}</strong>
+            </div>
+            <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",textTransform:"uppercase",letterSpacing:".8px",marginBottom:6}}>
+              Project outcome — what does "done" look like?
+            </div>
+            <input autoFocus value={outcome} onChange={e=>setOutcome(e.target.value)}
+              onKeyDown={e=>e.key==="Enter"&&can&&confirm()}
+              placeholder="e.g. Bathroom leak fully fixed"
+              style={{width:"100%",padding:"8px 10px",border:"1px solid #d1d5db",borderRadius:8,fontSize:13,outline:"none",marginBottom:14}}/>
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={confirm} disabled={!can}
+                style={{flex:1,padding:"10px",background:can?"#6366f1":"#e2e8f0",color:can?"#fff":"#94a3b8",border:"none",borderRadius:8,cursor:can?"pointer":"default",fontSize:13,fontWeight:600}}>
+                📋 Create project
+              </button>
+              <button onClick={onClose}
+                style={{flex:1,padding:"10px",background:"transparent",border:"1px solid #e2e8f0",borderRadius:8,cursor:"pointer",fontSize:13,color:"#64748b"}}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      );
     }
 
     // ── InboxFocus ────────────────────────────────────────────────

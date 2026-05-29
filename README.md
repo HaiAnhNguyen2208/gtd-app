@@ -5,7 +5,7 @@ the static front-end (no server, no data) so GitHub Pages can serve it over HTTP
 
 - **Source of truth:** the private `GTD` repo. Do not edit files here by hand —
   they are regenerated from the private repo's `templates/index.html` + `static/`
-  by `deploy_pages.ps1` and force-pushed.
+  by `deploy_pages.ps1` and pushed.
 - **No personal data lives here.** GTD data stays in each device's `localStorage`
   (and optionally your own OneDrive); none of it is in this repo.
 

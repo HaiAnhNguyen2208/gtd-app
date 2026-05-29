@@ -23,6 +23,37 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { margin: 0; }
+
+    /* ── Responsive app shell ──
+       Layout structure lives here (not inline) so it can adapt to viewport.
+       Wide screens: persistent sidebar beside the content (works in landscape).
+       Narrow screens: sidebar becomes an off-canvas drawer toggled by a button. */
+    .app-shell   { display:flex; height:100vh; height:100dvh; overflow:hidden; }
+    .app-sidebar { width:210px; flex-shrink:0; display:flex; flex-direction:column;
+                   overflow-y:auto; background:#0f172a; }
+    .app-main    { flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; }
+    .nav-toggle  { display:none; }          /* hamburger: hidden on wide screens */
+    .nav-backdrop{ display:none; }
+
+    /* Phones / very narrow windows — drawer sidebar over full-width content.
+       Targets portrait phones AND short landscape phones (max-height) so the
+       sidebar never eats the content area. */
+    @media (max-width: 760px), (max-height: 460px) and (max-width: 960px) {
+      .nav-toggle { display:inline-flex; align-items:center; justify-content:center; }
+      .app-sidebar {
+        position:fixed; top:0; left:0; bottom:0; height:100%;
+        width:78vw; max-width:300px; z-index:120;
+        transform:translateX(-100%);
+        transition:transform .22s ease;
+        box-shadow:0 0 40px rgba(0,0,0,.55);
+        padding-top:env(safe-area-inset-top);
+      }
+      .app-sidebar.open { transform:translateX(0); }
+      .nav-backdrop.show {
+        display:block; position:fixed; inset:0;
+        background:rgba(0,0,0,.5); z-index:110;
+      }
+    }
   </style>
 </head>
 <body>
@@ -253,6 +284,7 @@
       const [complCand, setComplCand]     = useState(null);
       const [history,  setHistory]        = useState([]);
       const [showData, setShowData]       = useState(false);
+      const [navOpen,  setNavOpen]        = useState(false);  // mobile drawer
       const fileInputRef = React.useRef(null);
       const importMode   = React.useRef("merge");
       // OneDrive cloud sync (optional)
@@ -489,10 +521,13 @@
                       : lastSyncRef.current ? `☁ Synced ${relTime(lastSyncRef.current)}` : "☁ Connected";
 
       return (
-        <div style={{display:"flex",height:"100vh",fontFamily:"'Inter',system-ui,sans-serif",background:"#f1f5f9",color:"#1e293b",overflow:"hidden"}}>
+        <div className="app-shell" style={{fontFamily:"'Inter',system-ui,sans-serif",background:"#f1f5f9",color:"#1e293b"}}>
+
+          {/* backdrop behind the mobile drawer — tap to close */}
+          <div className={"nav-backdrop"+(navOpen?" show":"")} onClick={()=>setNavOpen(false)}/>
 
           {/* ── Sidebar ── */}
-          <aside style={{width:210,background:"#0f172a",display:"flex",flexDirection:"column",flexShrink:0,overflowY:"auto"}}>
+          <aside className={"app-sidebar"+(navOpen?" open":"")}>
             <div style={{padding:"18px 16px 12px",borderBottom:"1px solid rgba(255,255,255,.06)"}}>
               <div style={{fontWeight:800,fontSize:15,color:"#f1f5f9",letterSpacing:"-.3px"}}>GTD System</div>
               <div style={{fontSize:10,color:"#475569",marginTop:2}}>David Allen methodology</div>
@@ -511,7 +546,7 @@
               {LISTS.map(l => {
                 const m=META[l], on=active===l;
                 return (
-                  <button key={l} onClick={()=>{setActive(l);setCtx("all");setShowForm(false);}}
+                  <button key={l} onClick={()=>{setActive(l);setCtx("all");setShowForm(false);setNavOpen(false);}}
                     style={{display:"flex",alignItems:"center",justifyContent:"space-between",width:"100%",padding:"8px 10px",background:on?"rgba(99,102,241,.18)":"transparent",border:"none",borderRadius:7,cursor:"pointer",color:on?"#a5b4fc":"#64748b",fontSize:12,fontWeight:on?600:400,textAlign:"left",marginBottom:1}}>
                     <span>{m.icon} {m.label}</span>
                     {(l==="done" ? todayDone : counts[l]) > 0 && (
@@ -524,7 +559,7 @@
               })}
             </nav>
             <div style={{padding:"8px 10px",borderTop:"1px solid rgba(255,255,255,.06)"}}>
-              <button onClick={()=>setShowData(true)}
+              <button onClick={()=>{setShowData(true);setNavOpen(false);}}
                 style={{display:"flex",alignItems:"center",gap:7,width:"100%",padding:"8px 10px",background:"transparent",border:"1px solid rgba(255,255,255,.1)",borderRadius:7,color:"#64748b",cursor:"pointer",fontSize:11,fontWeight:600,textAlign:"left"}}
                 onMouseEnter={e=>e.currentTarget.style.color="#a5b4fc"}
                 onMouseLeave={e=>e.currentTarget.style.color="#64748b"}>
@@ -543,11 +578,15 @@
           </aside>
 
           {/* ── Main ── */}
-          <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
-            <div style={{padding:"14px 22px",background:"#fff",borderBottom:"1px solid #e2e8f0",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}}>
-              <div>
-                <div style={{fontSize:17,fontWeight:700}}>{META[active].icon} {META[active].label}</div>
-                <div style={{fontSize:11,color:"#64748b",marginTop:1}}>{META[active].hint}</div>
+          <div className="app-main">
+            <div style={{padding:"14px 22px",background:"#fff",borderBottom:"1px solid #e2e8f0",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0,gap:10}}>
+              <div style={{display:"flex",alignItems:"center",gap:12,minWidth:0}}>
+                <button className="nav-toggle" onClick={()=>setNavOpen(true)} title="Menu" aria-label="Open menu"
+                  style={{width:38,height:38,flexShrink:0,background:"#fff",border:"1px solid #e2e8f0",borderRadius:9,cursor:"pointer",fontSize:17,color:"#475569",lineHeight:1}}>☰</button>
+                <div style={{minWidth:0}}>
+                  <div style={{fontSize:17,fontWeight:700,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{META[active].icon} {META[active].label}</div>
+                  <div style={{fontSize:11,color:"#64748b",marginTop:1,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{META[active].hint}</div>
+                </div>
               </div>
               <div style={{display:"flex",gap:6,alignItems:"center"}}>
                 {history.length > 0 && (

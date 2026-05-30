@@ -62,11 +62,22 @@
   <script type="text/babel">
     const { useState, useEffect, useCallback } = React;
 
+    // App build version — keep in sync with CACHE in static/sw.js. Shown in the
+    // sidebar footer so you can tell at a glance which build a device is running.
+    const APP_VERSION = "v12";
+
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     const LISTS    = ["inbox","next","projects","waiting","someday","reference","done"];
+    // Sidebar order — same as LISTS plus the Calendar view (a cross-list view, not
+    // a stored list, so it stays out of LISTS to keep data/count logic untouched).
+    const NAV      = ["today","inbox","next","calendar","projects","waiting","someday","reference","done"];
+    // Lists whose items can carry a dueDate and so appear on the Calendar.
+    const DATED    = ["next","waiting","projects","someday"];
     const META = {
+      today:     { icon:"🎯", label:"Today",          hint:"Your focus for today — plan and engage" },
       inbox:     { icon:"📥", label:"Inbox",         hint:"Capture everything — process later" },
       next:      { icon:"⚡", label:"Next Actions",   hint:"Next physical, visible actions" },
+      calendar:  { icon:"📅", label:"Calendar",       hint:"Scheduled items by due date" },
       projects:  { icon:"📋", label:"Projects",       hint:"Outcomes needing more than one step" },
       waiting:   { icon:"⏳", label:"Waiting For",    hint:"Delegated to or expected from others" },
       someday:   { icon:"🌟", label:"Someday/Maybe",  hint:"Ideas to revisit when the time is right" },
@@ -79,6 +90,7 @@
     const mk      = t  => ({ id: Date.now()+Math.random(), title:t.trim(), created:ts(), context:"@anywhere", dueDate:"", waitingFor:"" });
     const exProj  = t  => { const m=(t||"").match(/^\[([^\]]+)\]/); return m?m[1]:null; };
     const fmtDate = d  => { try{ return new Date(d).toLocaleDateString("vi-VN",{day:"2-digit",month:"2-digit",year:"numeric"}); }catch{return d||"";} };
+    const isoDate = d  => { const x=new Date(d); return `${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,"0")}-${String(x.getDate()).padStart(2,"0")}`; };
     const relTime = t  => { if(!t) return ""; const s=Math.max(0,Math.floor((Date.now()-t)/1000)); if(s<60) return "just now"; const m=Math.floor(s/60); if(m<60) return m+"m ago"; const h=Math.floor(m/60); if(h<24) return h+"h ago"; return Math.floor(h/24)+"d ago"; };
     const isOver  = d  => d && new Date(d+"T23:59") < new Date();
     const fresh   = () => ({ inbox:[], next:[], projects:[], waiting:[], someday:[], reference:[], done:[] });
@@ -276,7 +288,7 @@
     // ── App ───────────────────────────────────────────────────────
     function App() {
       const [items, setItems]             = useState(null);
-      const [active, setActive]           = useState("next");
+      const [active, setActive]           = useState("today");
       const [ctx, setCtx]                 = useState("all");
       const [capture, setCapture]         = useState("");
       const [showForm, setShowForm]       = useState(false);
@@ -487,6 +499,12 @@
 
       const del = (list, id) => upd({ ...items, [list]:items[list].filter(i=>i.id!==id) });
 
+      // Star/un-star a Next Action as today's focus (ephemeral, dated — see TodayView).
+      const toggleFocus = id => {
+        const t = isoDate(new Date());
+        upd({ ...items, next: items.next.map(i => i.id===id ? { ...i, focusDate: i.focusDate===t ? "" : t } : i) });
+      };
+
       const handleStalledDecision = (decision, proj, extra) => {
         let n = { ...items };
         if (decision==="next" && extra) {
@@ -536,6 +554,18 @@
       const counts = Object.fromEntries(LISTS.map(l=>[l,(items[l]||[]).length]));
       const todayStart = new Date(); todayStart.setHours(0,0,0,0);
       const todayDone  = (items.done||[]).filter(i=>new Date(i.doneAt||i.created)>=todayStart).length;
+      const plannedCount = DATED.reduce((n,l)=>n+(items[l]||[]).filter(i=>i.dueDate).length,0);
+      const todayISO = isoDate(new Date());
+      const todayFocus = (() => {
+        const seen=new Set(); let count=0, overdue=false;
+        DATED.forEach(l=>(items[l]||[]).forEach(i=>{
+          const od  = i.dueDate && i.dueDate < todayISO;
+          const due = i.dueDate === todayISO;
+          const foc = l==="next" && i.focusDate === todayISO;
+          if ((od||due||foc) && !seen.has(i.id)) { seen.add(i.id); count++; if (od) overdue=true; }
+        }));
+        return { count, overdue };
+      })();
       const projActions = {};
       (items.next||[]).forEach(a=>{ const p=exProj(a.title); if(p) (projActions[p]=projActions[p]||[]).push(a); });
 
@@ -572,15 +602,16 @@
               </div>
             </div>
             <nav style={{flex:1,padding:"6px 8px"}}>
-              {LISTS.map(l => {
+              {NAV.map(l => {
                 const m=META[l], on=active===l;
+                const badge = l==="done" ? todayDone : l==="calendar" ? plannedCount : l==="today" ? todayFocus.count : counts[l];
                 return (
                   <button key={l} onClick={()=>{setActive(l);setCtx("all");setShowForm(false);setNavOpen(false);}}
                     style={{display:"flex",alignItems:"center",justifyContent:"space-between",width:"100%",padding:"8px 10px",background:on?"rgba(99,102,241,.18)":"transparent",border:"none",borderRadius:7,cursor:"pointer",color:on?"#a5b4fc":"#64748b",fontSize:12,fontWeight:on?600:400,textAlign:"left",marginBottom:1}}>
                     <span>{m.icon} {m.label}</span>
-                    {(l==="done" ? todayDone : counts[l]) > 0 && (
-                      <span style={{background:l==="inbox"?"#ef4444":l==="done"?"#10b981":"#1e293b",color:"#fff",fontSize:9,padding:"1px 6px",borderRadius:20,fontWeight:700}}>
-                        {l==="done" ? todayDone : counts[l]}
+                    {badge > 0 && (
+                      <span style={{background:l==="inbox"?"#ef4444":l==="done"?"#10b981":l==="calendar"?"#6366f1":l==="today"?(todayFocus.overdue?"#ef4444":"#6366f1"):"#1e293b",color:"#fff",fontSize:9,padding:"1px 6px",borderRadius:20,fontWeight:700}}>
+                        {badge}
                       </span>
                     )}
                   </button>
@@ -601,8 +632,9 @@
                 </button>
               )}
             </div>
-            <div style={{padding:"8px 16px",fontSize:9,color:"#1e293b",borderTop:"1px solid rgba(255,255,255,.04)"}}>
-              Capture → Clarify → Organize → Reflect → Engage
+            <div style={{padding:"8px 16px",borderTop:"1px solid rgba(255,255,255,.04)"}}>
+              <div style={{fontSize:9,color:"#1e293b"}}>Capture → Clarify → Organize → Reflect → Engage</div>
+              <div style={{fontSize:9,color:"#475569",marginTop:3}}>GTD {APP_VERSION}</div>
             </div>
           </aside>
 
@@ -624,7 +656,7 @@
                     ↩ Undo
                   </button>
                 )}
-                {active!=="done" && (
+                {active!=="done" && active!=="calendar" && active!=="today" && (
                   <button onClick={()=>setShowForm(s=>!s)}
                     style={{padding:"7px 14px",background:"#6366f1",color:"#fff",border:"none",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:600}}>
                     {showForm?"Cancel":"+ Add"}
@@ -674,7 +706,16 @@
             )}
 
             <div style={{flex:1,overflowY:"auto",padding:"14px 22px"}}>
-              {active==="projects" ? (
+              {active==="today" ? (
+                <TodayView items={items} todayISO={todayISO}
+                  onComplete={(list,item)=>setComplCand({list,item})}
+                  onToggleFocus={toggleFocus}
+                  onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}/>
+              ) : active==="calendar" ? (
+                <CalendarView items={items}
+                  onComplete={(list,item)=>setComplCand({list,item})}
+                  onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}/>
+              ) : active==="projects" ? (
                 shown.length===0
                   ? <EmptyState list="projects"/>
                   : shown.map(p=>(
@@ -705,6 +746,8 @@
                         ? to=>upd({...items,[active]:items[active].filter(i=>i.id!==item.id),[to]:[item,...(items[to]||[])]})
                         : null}
                       onPromote={active==="next" ? ()=>setPromoteCand(item) : null}
+                      onToggleFocus={active==="next" ? ()=>toggleFocus(item.id) : null}
+                      focused={active==="next" && item.focusDate===todayISO}
                       currentList={active}/>
                   ))}
                 </div>
@@ -972,7 +1015,7 @@
     }
 
     // ── ItemCard ──────────────────────────────────────────────────
-    function ItemCard({ item, list, onComplete, onDelete, onProcess, onRestore, onMove, onPromote, currentList }) {
+    function ItemCard({ item, list, onComplete, onDelete, onProcess, onRestore, onMove, onPromote, onToggleFocus, focused, currentList }) {
       const [menuPos, setMenuPos] = useState(null);   // {top|bottom, right} in viewport coords, or null = closed
       const moveRef = React.useRef(null);
       const btnRef  = React.useRef(null);
@@ -1042,6 +1085,12 @@
           <div style={{display:"flex",gap:4,flexShrink:0,alignItems:"center"}}>
             {onProcess&&<button onClick={onProcess} style={{padding:"3px 8px",background:"#6366f1",color:"#fff",border:"none",borderRadius:5,cursor:"pointer",fontSize:10,fontWeight:700}}>Process</button>}
             {onRestore&&<button onClick={onRestore} style={{padding:"3px 8px",background:"#f1f5f9",color:"#475569",border:"1px solid #e2e8f0",borderRadius:5,cursor:"pointer",fontSize:10}}>Restore</button>}
+            {onToggleFocus&&(
+              <button onClick={onToggleFocus} title={focused?"Remove from today's focus":"Focus for today"}
+                style={{background:"none",border:"none",cursor:"pointer",color:focused?"#f59e0b":"#cbd5e1",fontSize:15,lineHeight:1,padding:"0 1px"}}>
+                {focused?"★":"☆"}
+              </button>
+            )}
             {(targets.length>0 || onPromote) && (
               <div ref={moveRef} style={{position:"relative"}}>
                 <button ref={btnRef} onClick={()=>showMove?setMenuPos(null):openMenu()}
@@ -1082,6 +1131,235 @@
               style={{background:"none",border:"none",cursor:"pointer",color:"#cbd5e1",fontSize:16,lineHeight:1}}
               onMouseEnter={e=>e.target.style.color="#ef4444"}
               onMouseLeave={e=>e.target.style.color="#cbd5e1"}>×</button>
+          </div>
+        </div>
+      );
+    }
+
+    // ── TodayView ─────────────────────────────────────────────────
+    // The daily-planning view. Not a stored list — a filter over the dated lists:
+    // "Focused today" = Next Actions you starred for today (ephemeral focusDate);
+    // "Due today"/"Overdue" = the hard landscape (any dated list). Unfinished focus
+    // simply isn't "today" tomorrow — it stays in Next Actions, no rollover guilt.
+    function TodayView({ items, todayISO, onComplete, onToggleFocus, onGoto }) {
+      const dateLabel = new Date(todayISO+"T00:00").toLocaleDateString("en-US",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
+
+      // classify, deduped by id with priority overdue > focus > due
+      const seen=new Set(), overdue=[], focus=[], due=[];
+      DATED.forEach(l=>(items[l]||[]).forEach(i=>{
+        if (seen.has(i.id)) return;
+        const it={...i,_list:l};
+        if (i.dueDate && i.dueDate < todayISO)        { overdue.push(it); seen.add(i.id); }
+        else if (l==="next" && i.focusDate===todayISO){ focus.push(it);   seen.add(i.id); }
+        else if (i.dueDate===todayISO)                { due.push(it);     seen.add(i.id); }
+      }));
+      const total = overdue.length + focus.length + due.length;
+
+      const Row = ({ i, ov }) => {
+        const pname = exProj(i.title);
+        const title = i._list==="next" && pname ? i.title.replace(/^\[[^\]]+\]\s*/,"") : i.title;
+        const foc   = i._list==="next" && i.focusDate===todayISO;
+        return (
+          <div style={{display:"flex",alignItems:"flex-start",gap:10,padding:"9px 11px",border:`1px solid ${ov?"#fca5a5":"#e2e8f0"}`,borderRadius:9,background:ov?"#fff7f7":"#fff"}}>
+            {i._list!=="projects" ? (
+              <button onClick={()=>onComplete(i._list,{...i})} title="Mark done"
+                style={{width:18,height:18,borderRadius:"50%",border:"2px solid #cbd5e1",background:"#fff",cursor:"pointer",flexShrink:0,marginTop:1}}
+                onMouseEnter={e=>e.target.style.borderColor="#6366f1"}
+                onMouseLeave={e=>e.target.style.borderColor="#cbd5e1"}/>
+            ) : <span style={{fontSize:14,flexShrink:0,marginTop:1}}>📋</span>}
+            <div style={{flex:1,minWidth:0}}>
+              {i._list==="next" && pname && <div style={{fontSize:10,color:"#7c3aed",fontWeight:600,marginBottom:2}}>📋 {pname}</div>}
+              <div style={{fontSize:13,fontWeight:500,wordBreak:"break-word"}}>{title}</div>
+              <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap",alignItems:"center"}}>
+                <Tag bg="#eef2ff" c="#4338ca">{META[i._list].icon} {META[i._list].label}</Tag>
+                {i.context&&i.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{i.context}</Tag>}
+                {i.waitingFor&&<Tag bg="#fffbeb" c="#b45309">👤 {i.waitingFor}</Tag>}
+                {i.dueDate&&<Tag bg={ov?"#fef2f2":"#f0fdf4"} c={ov?"#b91c1c":"#166534"}>{ov?"⚠️ ":"📅 "}{i.dueDate}</Tag>}
+              </div>
+            </div>
+            {i._list==="next" && onToggleFocus && (
+              <button onClick={()=>onToggleFocus(i.id)} title={foc?"Remove from today's focus":"Focus for today"}
+                style={{background:"none",border:"none",cursor:"pointer",color:foc?"#f59e0b":"#cbd5e1",fontSize:15,lineHeight:1,padding:"0 1px",flexShrink:0}}>
+                {foc?"★":"☆"}
+              </button>
+            )}
+            <button onClick={()=>onGoto(i._list)} title={"Open "+META[i._list].label}
+              style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:14,lineHeight:1,padding:"0 2px",flexShrink:0}}
+              onMouseEnter={e=>e.currentTarget.style.color="#6366f1"}
+              onMouseLeave={e=>e.currentTarget.style.color="#94a3b8"}>↗</button>
+          </div>
+        );
+      };
+
+      const Section = ({ label, list, ov }) => list.length===0 ? null : (
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",textTransform:"uppercase",letterSpacing:".8px",marginBottom:7}}>
+            {label} <span style={{color:"#cbd5e1"}}>· {list.length}</span>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {list.map(i=><Row key={i.id} i={i} ov={ov||(i.dueDate&&i.dueDate<todayISO)}/>)}
+          </div>
+        </div>
+      );
+
+      return (
+        <div>
+          <div style={{display:"flex",alignItems:"baseline",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:6}}>
+            <div style={{fontSize:15,fontWeight:700}}>{dateLabel}</div>
+            <div style={{fontSize:11,color:"#64748b"}}>{total} {total===1?"item":"items"} on deck</div>
+          </div>
+          {total===0 ? (
+            <div style={{textAlign:"center",padding:"48px 20px",color:"#94a3b8"}}>
+              <div style={{fontSize:38,marginBottom:10}}>🎯</div>
+              <div style={{fontSize:14,fontWeight:600,color:"#475569"}}>No plan for today yet.</div>
+              <div style={{fontSize:12,marginTop:4,marginBottom:16}}>Star the next actions you'll focus on today — nothing's due or overdue.</div>
+              <button onClick={()=>onGoto("next")}
+                style={{padding:"8px 16px",background:"#6366f1",color:"#fff",border:"none",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:600}}>
+                ⚡ Pick from Next Actions
+              </button>
+            </div>
+          ) : (
+            <React.Fragment>
+              <Section label="⚠️ Overdue"        list={overdue} ov={true}/>
+              <Section label="🎯 Focused today"  list={focus}   ov={false}/>
+              <Section label="📅 Due today"      list={due}     ov={false}/>
+            </React.Fragment>
+          )}
+        </div>
+      );
+    }
+
+    // ── CalendarView ──────────────────────────────────────────────
+    // A cross-list month grid of every dated item (next/waiting/projects/someday).
+    // Read-mostly: click a day to inspect its items; complete or jump to the source
+    // list from the day panel. Not a stored list — derives entirely from `items`.
+    const WEEKDAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+    function CalendarView({ items, onComplete, onGoto }) {
+      const today = new Date(); today.setHours(0,0,0,0);
+      const todayISO = isoDate(today);
+      const [cursor,   setCursor]   = useState(() => new Date(today.getFullYear(), today.getMonth(), 1));
+      const [selected, setSelected] = useState(todayISO);
+
+      // bucket every dated item by its YYYY-MM-DD due date
+      const byDate = {};
+      DATED.forEach(l => (items[l]||[]).forEach(i => {
+        if (!i.dueDate) return;
+        (byDate[i.dueDate] = byDate[i.dueDate] || []).push({ ...i, _list:l });
+      }));
+
+      const y = cursor.getFullYear(), mo = cursor.getMonth();
+      const startDow    = (new Date(y, mo, 1).getDay() + 6) % 7;   // Monday-first
+      const daysInMonth = new Date(y, mo + 1, 0).getDate();
+      const cells = [];
+      for (let i=0; i<startDow; i++)      cells.push(null);
+      for (let d=1; d<=daysInMonth; d++)  cells.push(new Date(y, mo, d));
+      while (cells.length % 7 !== 0)      cells.push(null);
+
+      const monthLabel = cursor.toLocaleDateString("en-US", { month:"long", year:"numeric" });
+      const stepMonth  = n => setCursor(new Date(y, mo + n, 1));
+      const goToday    = () => { setCursor(new Date(today.getFullYear(), today.getMonth(), 1)); setSelected(todayISO); };
+      const selItems   = byDate[selected] || [];
+
+      const navBtn = {width:30,height:30,borderRadius:8,border:"1px solid #e2e8f0",background:"#fff",cursor:"pointer",color:"#475569",fontSize:14,lineHeight:1};
+      const dot    = { next:"#6366f1", waiting:"#f59e0b", projects:"#7c3aed", someday:"#94a3b8" };
+
+      return (
+        <div>
+          {/* month navigation */}
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              <button onClick={()=>stepMonth(-1)} style={navBtn} title="Previous month">‹</button>
+              <div style={{fontSize:15,fontWeight:700,minWidth:148,textAlign:"center"}}>{monthLabel}</div>
+              <button onClick={()=>stepMonth(1)} style={navBtn} title="Next month">›</button>
+            </div>
+            <button onClick={goToday}
+              style={{padding:"6px 12px",background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:600,color:"#475569"}}>
+              Today
+            </button>
+          </div>
+
+          {/* weekday header */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4,marginBottom:4}}>
+            {WEEKDAYS.map(w=>(
+              <div key={w} style={{fontSize:10,fontWeight:700,color:"#94a3b8",textTransform:"uppercase",letterSpacing:".5px",textAlign:"center",padding:"2px 0"}}>{w}</div>
+            ))}
+          </div>
+
+          {/* month grid */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4}}>
+            {cells.map((d,idx)=>{
+              if (!d) return <div key={idx} style={{minHeight:74,background:"#f8fafc",borderRadius:8}}/>;
+              const iso     = isoDate(d);
+              const dayList = byDate[iso] || [];
+              const isToday = iso===todayISO;
+              const isSel   = iso===selected;
+              const overdue = iso < todayISO;
+              return (
+                <button key={idx} onClick={()=>setSelected(iso)}
+                  style={{minHeight:74,textAlign:"left",padding:"5px 6px",borderRadius:8,cursor:"pointer",display:"flex",flexDirection:"column",gap:3,
+                          background:isSel?"#eef2ff":"#fff",border:`1px solid ${isSel?"#6366f1":"#e2e8f0"}`,outline:"none"}}>
+                  <div style={{display:"flex",justifyContent:"center"}}>
+                    <span style={{fontSize:11,fontWeight:700,width:20,height:20,lineHeight:"20px",textAlign:"center",borderRadius:"50%",
+                                  background:isToday?"#6366f1":"transparent",color:isToday?"#fff":"#475569"}}>{d.getDate()}</span>
+                  </div>
+                  <div style={{display:"flex",flexDirection:"column",gap:2,overflow:"hidden"}}>
+                    {dayList.slice(0,3).map(i=>(
+                      <div key={i.id} title={i.title}
+                        style={{display:"flex",alignItems:"center",gap:3,fontSize:9,lineHeight:1.2,color:overdue?"#b91c1c":"#334155",
+                                whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
+                        <span style={{width:5,height:5,borderRadius:"50%",flexShrink:0,background:overdue?"#ef4444":dot[i._list]||"#94a3b8"}}/>
+                        <span style={{overflow:"hidden",textOverflow:"ellipsis"}}>{i._list==="next"?(i.title.replace(/^\[[^\]]+\]\s*/,"")):i.title}</span>
+                      </div>
+                    ))}
+                    {dayList.length>3 && <div style={{fontSize:9,color:"#94a3b8",fontWeight:600}}>+{dayList.length-3} more</div>}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* selected-day panel */}
+          <div style={{marginTop:16,background:"#fff",border:"1px solid #e2e8f0",borderRadius:10,padding:"14px 16px"}}>
+            <div style={{fontSize:13,fontWeight:700,marginBottom:selItems.length?10:0}}>
+              {new Date(selected+"T00:00").toLocaleDateString("en-US",{weekday:"long",day:"numeric",month:"long",year:"numeric"})}
+              {selected===todayISO && <span style={{marginLeft:8,fontSize:10,color:"#6366f1",fontWeight:700}}>TODAY</span>}
+            </div>
+            {selItems.length===0 ? (
+              <div style={{fontSize:12,color:"#94a3b8",fontStyle:"italic"}}>Nothing scheduled.</div>
+            ) : (
+              <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                {selItems.map(i=>{
+                  const ov    = selected < todayISO;
+                  const pname = exProj(i.title);
+                  const title = i._list==="next" && pname ? i.title.replace(/^\[[^\]]+\]\s*/,"") : i.title;
+                  return (
+                    <div key={i.id}
+                      style={{display:"flex",alignItems:"flex-start",gap:10,padding:"9px 11px",border:`1px solid ${ov?"#fca5a5":"#e2e8f0"}`,borderRadius:9,background:ov?"#fff7f7":"#fff"}}>
+                      {i._list!=="projects" ? (
+                        <button onClick={()=>onComplete(i._list,{...i})} title="Mark done"
+                          style={{width:18,height:18,borderRadius:"50%",border:"2px solid #cbd5e1",background:"#fff",cursor:"pointer",flexShrink:0,marginTop:1}}
+                          onMouseEnter={e=>e.target.style.borderColor="#6366f1"}
+                          onMouseLeave={e=>e.target.style.borderColor="#cbd5e1"}/>
+                      ) : <span style={{fontSize:14,flexShrink:0,marginTop:1}}>📋</span>}
+                      <div style={{flex:1,minWidth:0}}>
+                        {i._list==="next" && pname && <div style={{fontSize:10,color:"#7c3aed",fontWeight:600,marginBottom:2}}>📋 {pname}</div>}
+                        <div style={{fontSize:13,fontWeight:500,wordBreak:"break-word"}}>{title}</div>
+                        <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap",alignItems:"center"}}>
+                          <Tag bg="#eef2ff" c="#4338ca">{META[i._list].icon} {META[i._list].label}</Tag>
+                          {i.context&&i.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{i.context}</Tag>}
+                          {i.waitingFor&&<Tag bg="#fffbeb" c="#b45309">👤 {i.waitingFor}</Tag>}
+                          {ov&&<Tag bg="#fef2f2" c="#b91c1c">⚠️ overdue</Tag>}
+                        </div>
+                      </div>
+                      <button onClick={()=>onGoto(i._list)} title={"Open "+META[i._list].label}
+                        style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:14,lineHeight:1,padding:"0 2px",flexShrink:0}}
+                        onMouseEnter={e=>e.currentTarget.style.color="#6366f1"}
+                        onMouseLeave={e=>e.currentTarget.style.color="#94a3b8"}>↗</button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       );

@@ -64,7 +64,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v12";
+    const APP_VERSION = "v13";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     const LISTS    = ["inbox","next","projects","waiting","someday","reference","done"];
@@ -299,6 +299,7 @@
       const [history,  setHistory]        = useState([]);
       const [showData, setShowData]       = useState(false);
       const [navOpen,  setNavOpen]        = useState(false);  // mobile drawer
+      const [updateReady, setUpdateReady] = useState(false);  // new build deployed → offer reload
       const fileInputRef = React.useRef(null);
       const importMode   = React.useRef("merge");
       // OneDrive cloud sync (optional)
@@ -318,6 +319,13 @@
 
       // keep a ref of the latest items for async sync callbacks (avoids stale closures)
       useEffect(() => { itemsRef.current = items; }, [items]);
+
+      // a freshly deployed build took control (see the SW registration script) → prompt to reload
+      useEffect(() => {
+        const h = () => setUpdateReady(true);
+        window.addEventListener("gtd:update-ready", h);
+        return () => window.removeEventListener("gtd:update-ready", h);
+      }, []);
 
       // process any pending MSAL redirect response once on load (no-op for popup flow).
       // If we returned from a loginRedirect fallback, finish the connection here.
@@ -811,6 +819,20 @@
               }}
               onTrash={()=>{del("inbox",procItem.id);setProcItem(null);}}
               onClose={()=>setProcItem(null)}/>
+          )}
+
+          {updateReady && (
+            <div style={{position:"fixed",left:"50%",bottom:18,transform:"translateX(-50%)",zIndex:400,
+                         display:"flex",alignItems:"center",gap:12,padding:"10px 14px",background:"#1e293b",color:"#f1f5f9",
+                         borderRadius:10,boxShadow:"0 10px 30px rgba(0,0,0,.3)",fontSize:12,maxWidth:"92vw"}}>
+              <span>🔄 A new version is ready.</span>
+              <button onClick={()=>window.location.reload()}
+                style={{padding:"5px 12px",background:"#6366f1",color:"#fff",border:"none",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:700}}>
+                Reload
+              </button>
+              <button onClick={()=>setUpdateReady(false)} title="Dismiss"
+                style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:16,lineHeight:1,padding:"0 2px"}}>×</button>
+            </div>
           )}
         </div>
       );
@@ -1861,11 +1883,27 @@
     ReactDOM.createRoot(document.getElementById("root")).render(<App />);
   </script>
 
-  <!-- Register service worker so the app installs and runs fully offline -->
+  <!-- Register service worker so the app installs and runs fully offline,
+       and surface an in-app "new version" prompt when a fresh build deploys. -->
   <script>
     if ("serviceWorker" in navigator) {
       window.addEventListener("load", () => {
-        navigator.serviceWorker.register("sw.js").catch(() => {});
+        navigator.serviceWorker.register("sw.js").then((reg) => {
+          // Proactively check for a newly deployed shell while the app stays open.
+          setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000);   // hourly
+          document.addEventListener("visibilitychange", () => {
+            if (!document.hidden) reg.update().catch(() => {});              // and on focus
+          });
+        }).catch(() => {});
+
+        // The SW skip-waits + claims, so a new build takes control via
+        // "controllerchange". The very first control (fresh install) isn't an
+        // update — ignore it; any later one means a new version is live.
+        let hadController = !!navigator.serviceWorker.controller;
+        navigator.serviceWorker.addEventListener("controllerchange", () => {
+          if (!hadController) { hadController = true; return; }
+          window.dispatchEvent(new CustomEvent("gtd:update-ready"));
+        });
       });
     }
   </script>

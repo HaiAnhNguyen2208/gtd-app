@@ -64,7 +64,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v13";
+    const APP_VERSION = "v14";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     const LISTS    = ["inbox","next","projects","waiting","someday","reference","done"];
@@ -73,6 +73,10 @@
     const NAV      = ["today","inbox","next","calendar","projects","waiting","someday","reference","done"];
     // Lists whose items can carry a dueDate and so appear on the Calendar.
     const DATED    = ["next","waiting","projects","someday"];
+    // Lists the Today view draws from — actionable work only. Projects are outcomes
+    // (you do their next actions, not the project), and Someday is "not now", so neither
+    // belongs in "do today"; their dates still show on the Calendar.
+    const TODAY_LISTS = ["next","waiting"];
     const META = {
       today:     { icon:"🎯", label:"Today",          hint:"Your focus for today — plan and engage" },
       inbox:     { icon:"📥", label:"Inbox",         hint:"Capture everything — process later" },
@@ -566,7 +570,7 @@
       const todayISO = isoDate(new Date());
       const todayFocus = (() => {
         const seen=new Set(); let count=0, overdue=false;
-        DATED.forEach(l=>(items[l]||[]).forEach(i=>{
+        TODAY_LISTS.forEach(l=>(items[l]||[]).forEach(i=>{
           const od  = i.dueDate && i.dueDate < todayISO;
           const due = i.dueDate === todayISO;
           const foc = l==="next" && i.focusDate === todayISO;
@@ -1168,7 +1172,7 @@
 
       // classify, deduped by id with priority overdue > focus > due
       const seen=new Set(), overdue=[], focus=[], due=[];
-      DATED.forEach(l=>(items[l]||[]).forEach(i=>{
+      TODAY_LISTS.forEach(l=>(items[l]||[]).forEach(i=>{
         if (seen.has(i.id)) return;
         const it={...i,_list:l};
         if (i.dueDate && i.dueDate < todayISO)        { overdue.push(it); seen.add(i.id); }

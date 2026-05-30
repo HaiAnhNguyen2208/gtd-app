@@ -5,7 +5,7 @@
  * never intercepted — they hit the network when a server is reachable and are
  * simply allowed to fail offline (the app falls back to localStorage). */
 
-const CACHE = "gtd-v13";
+const CACHE = "gtd-v14";
 
 const SHELL = [
   "./",

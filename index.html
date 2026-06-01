@@ -64,7 +64,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v22";
+    const APP_VERSION = "v23";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     // GTD's other two "engage" criteria beyond context: energy available and time at hand.
@@ -110,6 +110,19 @@
     // Next Actions / Waiting / Today lists until its start day, then it resurfaces.
     const isDeferred = (i, today) => i.startDate && i.startDate > today;
     const fresh   = () => ({ inbox:[], next:[], projects:[], waiting:[], someday:[], reference:[], done:[] });
+    // PWA share target: when the user shares text/a link from another app (Android/Win),
+    // the OS launches us at start_url with ?title/&text/&url. Read it once into a capture
+    // string and strip the query so a reload can't re-add it. Returns "" when not a share.
+    const readSharedCapture = () => {
+      try {
+        const p = new URLSearchParams(location.search);
+        const parts = [];
+        ["title","text","url"].forEach(k => { const v=(p.get(k)||"").trim(); if (v && !parts.includes(v)) parts.push(v); });
+        if (!parts.length) return "";
+        history.replaceState(null, "", location.pathname);
+        return parts.join(" — ");
+      } catch { return ""; }
+    };
     // Pick the candidate with the newest _updatedAt (strict — ties keep the earlier one,
     // so local wins ties and remotes are adopted only when genuinely newer).
     const pickNewest = cands => {
@@ -369,6 +382,7 @@
         const base      = fresh();
         const local     = Store.loadLocal();
         const localFull = local ? { ...base, ...local } : base;
+        const shared    = readSharedCapture();   // PWA "share to GTD" → straight into the Inbox
         setItems(localFull);
         (async () => {
           const [server, drive] = await Promise.all([ Store.fetchServer(), Drive.pull() ]);
@@ -377,8 +391,10 @@
             { src:"flask", data: server || null },
             { src:"drive", data: drive && drive.data ? drive.data : null },
           ]);
-          const chosen = winner && winner.data ? { ...base, ...winner.data } : localFull;
-          if (winner && winner.src !== "local") { setItems(chosen); Store.saveLocal(chosen); }
+          let chosen = winner && winner.data ? { ...base, ...winner.data } : localFull;
+          // graft a shared capture onto the reconciled state and re-stamp so it wins everywhere
+          if (shared) chosen = { ...chosen, inbox:[mk(shared), ...(chosen.inbox||[])], _updatedAt: Date.now() };
+          if (shared || (winner && winner.src !== "local")) { setItems(chosen); Store.saveLocal(chosen); }
           const cT = chosen._updatedAt || 0;
           if (!server || (server._updatedAt || 0) < cT) Store.pushServer(chosen);             // push to Flask if behind
           if (Drive.enabled() && (!drive || ((drive.data && drive.data._updatedAt) || 0) < cT)) Drive.push(chosen);

@@ -55,6 +55,55 @@
         background:rgba(0,0,0,.5); z-index:110;
       }
     }
+
+    /* ── Design system ──
+       Shared tokens + component classes so styling stays consistent and edits
+       happen in one place. Hover/focus live here (CSS :hover) instead of inline
+       onMouseEnter/Leave handlers. Components reference these via className. */
+    :root{
+      --indigo:#6366f1; --indigo-d:#4f46e5; --indigo-soft:#eef2ff; --indigo-ink:#4338ca;
+      --ink:#1e293b; --muted:#64748b; --faint:#94a3b8;
+      --line:#e2e8f0; --line-2:#d1d5db; --bg-soft:#f8fafc; --bg-form:#fafaf9;
+      --red:#ef4444; --red-ink:#b91c1c; --amber:#f59e0b; --green:#10b981;
+    }
+    /* inputs & selects */
+    .in{ width:100%; padding:8px 10px; border:1px solid var(--line-2); border-radius:8px;
+         font-size:13px; outline:none; background:#fff; color:var(--ink); font-family:inherit; }
+    .in:focus{ border-color:var(--indigo); }
+    .in-sm{ padding:7px 9px; font-size:12px; border-radius:7px; }
+    select.in{ cursor:pointer; }
+    /* stacked label + control */
+    .fld{ display:flex; flex-direction:column; gap:3px; min-width:0; }
+    .fld > span{ font-size:9px; font-weight:600; color:var(--faint);
+                 text-transform:uppercase; letter-spacing:.4px; }
+    /* buttons */
+    .btn{ border:none; border-radius:8px; cursor:pointer; font-size:13px; font-weight:600;
+          padding:9px 16px; line-height:1.2; font-family:inherit;
+          transition:background .15s, border-color .15s, color .15s; }
+    .btn:disabled{ cursor:default; }
+    .btn-sm{ padding:6px 12px; font-size:12px; border-radius:7px; }
+    .btn-pri{ background:var(--indigo); color:#fff; }
+    .btn-pri:hover{ background:var(--indigo-d); }
+    .btn-pri:disabled{ background:var(--line); color:var(--faint); }
+    .btn-ghost{ background:#fff; color:var(--muted); border:1px solid var(--line); }
+    .btn-ghost:hover{ border-color:var(--indigo); color:var(--indigo); }
+    /* bare icon button (✎ ↗ ☆ ×) */
+    .ibtn{ background:none; border:none; cursor:pointer; color:var(--faint);
+           line-height:1; padding:0 2px; transition:color .15s; }
+    .ibtn:hover{ color:var(--indigo); }
+    /* filter chip */
+    .chip{ padding:3px 10px; border-radius:20px; border:1px solid var(--line);
+           background:#fff; color:var(--muted); cursor:pointer; font-size:11px; font-family:inherit; }
+    .chip:hover{ border-color:var(--indigo); }
+    .chip.on{ border-color:var(--indigo); background:var(--indigo); color:#fff; font-weight:600; }
+    /* modal chrome */
+    .ov{ position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex;
+         align-items:center; justify-content:center; z-index:200; padding:14px; }
+    .mbox{ background:#fff; border-radius:14px; padding:22px; width:420px; max-width:92vw;
+           max-height:92vh; overflow-y:auto; box-shadow:0 20px 60px rgba(0,0,0,.2); }
+    /* uppercase section label */
+    .slabel{ font-size:10px; font-weight:700; color:var(--faint);
+             text-transform:uppercase; letter-spacing:.8px; }
   </style>
 </head>
 <body>
@@ -64,7 +113,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v23";
+    const APP_VERSION = "v24";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     // GTD's other two "engage" criteria beyond context: energy available and time at hand.
@@ -752,21 +801,20 @@
             </div>
 
             {active==="next" && (
-              <div style={{padding:"8px 22px",background:"#fff",borderBottom:"1px solid #e2e8f0",display:"flex",gap:5,flexWrap:"wrap",alignItems:"center",flexShrink:0}}>
+              <div style={{padding:"8px 22px",background:"#fff",borderBottom:"1px solid var(--line)",display:"flex",gap:6,flexWrap:"wrap",alignItems:"center",flexShrink:0}}>
                 {["all",...CONTEXTS].map(c=>(
-                  <button key={c} onClick={()=>setCtx(c)}
-                    style={{padding:"3px 10px",borderRadius:20,border:`1px solid ${ctx===c?"#6366f1":"#e2e8f0"}`,background:ctx===c?"#6366f1":"#fff",color:ctx===c?"#fff":"#64748b",cursor:"pointer",fontSize:11,fontWeight:ctx===c?600:400}}>
+                  <button key={c} onClick={()=>setCtx(c)} className={"chip"+(ctx===c?" on":"")}>
                     {c==="all"?"All":c}
                   </button>
                 ))}
-                <span style={{width:1,height:18,background:"#e2e8f0",margin:"0 3px"}}/>
+                <span style={{width:1,height:18,background:"var(--line)",margin:"0 3px"}}/>
                 <select value={enerF} onChange={e=>setEnerF(e.target.value)} title="Filter by energy available"
-                  style={{padding:"3px 6px",borderRadius:20,border:`1px solid ${enerF!=="all"?"#6366f1":"#e2e8f0"}`,background:"#fff",color:enerF!=="all"?"#4338ca":"#64748b",cursor:"pointer",fontSize:11,fontWeight:enerF!=="all"?600:400}}>
+                  className={"chip"+(enerF!=="all"?" on":"")} style={{padding:"3px 8px"}}>
                   <option value="all">🔋 Any energy</option>
                   {ENERGIES.map(e=><option key={e} value={e}>🔋 {e}</option>)}
                 </select>
                 <select value={timeF} onChange={e=>setTimeF(e.target.value)} title="Filter by time available"
-                  style={{padding:"3px 6px",borderRadius:20,border:`1px solid ${timeF!=="all"?"#6366f1":"#e2e8f0"}`,background:"#fff",color:timeF!=="all"?"#4338ca":"#64748b",cursor:"pointer",fontSize:11,fontWeight:timeF!=="all"?600:400}}>
+                  className={"chip"+(timeF!=="all"?" on":"")} style={{padding:"3px 8px"}}>
                   <option value="all">⏱ Any time</option>
                   {TIMES.map(t=><option key={t} value={t}>⏱ {t}</option>)}
                 </select>
@@ -774,63 +822,58 @@
             )}
 
             {showForm && active!=="done" && (
-              <div style={{padding:"10px 22px",background:"#fafaf9",borderBottom:"1px solid #e2e8f0",flexShrink:0}}>
-                <div style={{display:"flex",gap:7,flexWrap:"wrap",alignItems:"flex-end"}}>
-                  <input autoFocus value={form.title} onChange={e=>setForm({...form,title:e.target.value})}
-                    onKeyDown={e=>e.key==="Enter"&&addItem()} placeholder={placeFor(active)}
-                    style={{flex:"1 1 200px",padding:"7px 10px",border:"1px solid #d1d5db",borderRadius:7,fontSize:13,outline:"none"}}/>
-                  {active==="next" && (
-                    <select value={form.context} onChange={e=>setForm({...form,context:e.target.value})}
-                      style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff"}}>
-                      {CONTEXTS.map(c=><option key={c}>{c}</option>)}
-                    </select>
-                  )}
-                  {active==="next" && (
-                    <React.Fragment>
-                      <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Energy
-                        <select value={form.energy} onChange={e=>setForm({...form,energy:e.target.value})}
-                          style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff"}}>
-                          <option value="">—</option>
-                          {ENERGIES.map(en=><option key={en} value={en}>{en}</option>)}
-                        </select>
-                      </label>
-                      <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Time
-                        <select value={form.time} onChange={e=>setForm({...form,time:e.target.value})}
-                          style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff"}}>
-                          <option value="">—</option>
-                          {TIMES.map(t=><option key={t} value={t}>{t}</option>)}
-                        </select>
-                      </label>
-                    </React.Fragment>
-                  )}
-                  {active==="waiting" && (
-                    <input value={form.waitingFor} onChange={e=>setForm({...form,waitingFor:e.target.value})}
-                      placeholder="From whom?"
-                      style={{flex:"1 1 130px",padding:"7px 10px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,outline:"none"}}/>
-                  )}
-                  {["next","projects","waiting"].includes(active) && (
-                    <React.Fragment>
-                      <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Start
-                        <input type="date" value={form.startDate} onChange={e=>setForm({...form,startDate:e.target.value})}
-                          style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
-                      </label>
-                      <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Due
-                        <input type="date" value={form.dueDate} onChange={e=>setForm({...form,dueDate:e.target.value,dueTime:e.target.value?form.dueTime:""})}
-                          style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
-                      </label>
-                      {form.dueDate && (
-                        <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}} title="Optional — set a time only for a real appointment">Time
-                          <input type="time" value={form.dueTime} onChange={e=>setForm({...form,dueTime:e.target.value})}
-                            style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
-                        </label>
-                      )}
-                    </React.Fragment>
-                  )}
-                  <button onClick={addItem}
-                    style={{padding:"7px 16px",background:"#6366f1",color:"#fff",border:"none",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:600}}>
-                    Add
-                  </button>
+              <div style={{padding:"12px 22px",background:"var(--bg-form)",borderBottom:"1px solid var(--line)",flexShrink:0}}>
+                {/* row 1 — the thing itself */}
+                <div style={{display:"flex",gap:8}}>
+                  <input autoFocus className="in" style={{flex:1}} value={form.title}
+                    onChange={e=>setForm({...form,title:e.target.value})}
+                    onKeyDown={e=>e.key==="Enter"&&addItem()} placeholder={placeFor(active)}/>
+                  <button className="btn btn-pri" onClick={addItem}>Add</button>
                 </div>
+                {/* row 2 — its attributes (only lists that have any) */}
+                {["next","projects","waiting"].includes(active) && (
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"flex-end",marginTop:9}}>
+                    {active==="next" && (
+                      <label className="fld"><span>Context</span>
+                        <select className="in in-sm" value={form.context} onChange={e=>setForm({...form,context:e.target.value})}>
+                          {CONTEXTS.map(c=><option key={c}>{c}</option>)}
+                        </select>
+                      </label>
+                    )}
+                    {active==="waiting" && (
+                      <label className="fld" style={{flex:"1 1 160px"}}><span>From whom</span>
+                        <input className="in in-sm" value={form.waitingFor} onChange={e=>setForm({...form,waitingFor:e.target.value})} placeholder="Person / source"/>
+                      </label>
+                    )}
+                    {active==="next" && (
+                      <React.Fragment>
+                        <label className="fld"><span>Energy</span>
+                          <select className="in in-sm" value={form.energy} onChange={e=>setForm({...form,energy:e.target.value})}>
+                            <option value="">—</option>
+                            {ENERGIES.map(en=><option key={en} value={en}>{en}</option>)}
+                          </select>
+                        </label>
+                        <label className="fld"><span>Time</span>
+                          <select className="in in-sm" value={form.time} onChange={e=>setForm({...form,time:e.target.value})}>
+                            <option value="">—</option>
+                            {TIMES.map(t=><option key={t} value={t}>{t}</option>)}
+                          </select>
+                        </label>
+                      </React.Fragment>
+                    )}
+                    <label className="fld"><span>Start</span>
+                      <input className="in in-sm" type="date" value={form.startDate} onChange={e=>setForm({...form,startDate:e.target.value})}/>
+                    </label>
+                    <label className="fld"><span>Due</span>
+                      <input className="in in-sm" type="date" value={form.dueDate} onChange={e=>setForm({...form,dueDate:e.target.value,dueTime:e.target.value?form.dueTime:""})}/>
+                    </label>
+                    {form.dueDate && (
+                      <label className="fld" title="Optional — set a time only for a real appointment"><span>Time</span>
+                        <input className="in in-sm" type="time" value={form.dueTime} onChange={e=>setForm({...form,dueTime:e.target.value})}/>
+                      </label>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 

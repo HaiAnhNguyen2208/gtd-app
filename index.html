@@ -64,9 +64,13 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v21";
+    const APP_VERSION = "v22";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
+    // GTD's other two "engage" criteria beyond context: energy available and time at hand.
+    // Optional on a Next Action; "" = unset. Stored as these literal labels.
+    const ENERGIES = ["Low","Med","High"];
+    const TIMES    = ["<15m","<1h",">1h"];
     const LISTS    = ["inbox","next","projects","waiting","someday","reference","done"];
     // Sidebar order — same as LISTS plus the Calendar view (a cross-list view, not
     // a stored list, so it stays out of LISTS to keep data/count logic untouched).
@@ -92,7 +96,7 @@
 
     // ── Helpers ───────────────────────────────────────────────────
     const ts      = () => new Date().toISOString();
-    const mk      = t  => ({ id: Date.now()+Math.random(), title:t.trim(), created:ts(), context:"@anywhere", dueDate:"", dueTime:"", startDate:"", waitingFor:"" });
+    const mk      = t  => ({ id: Date.now()+Math.random(), title:t.trim(), created:ts(), context:"@anywhere", dueDate:"", dueTime:"", startDate:"", waitingFor:"", energy:"", time:"" });
     const exProj  = t  => { const m=(t||"").match(/^\[([^\]]+)\]/); return m?m[1]:null; };
     const fmtDate = d  => { try{ return new Date(d).toLocaleDateString("vi-VN",{day:"2-digit",month:"2-digit",year:"numeric"}); }catch{return d||"";} };
     // "HH:MM" (24h) → "h:mm AM/PM"; blank stays blank. Optional time turns a due DATE into a
@@ -305,7 +309,9 @@
       const [ctx, setCtx]                 = useState("all");
       const [capture, setCapture]         = useState("");
       const [showForm, setShowForm]       = useState(false);
-      const [form, setForm]               = useState({title:"",context:"@anywhere",dueDate:"",dueTime:"",startDate:"",waitingFor:""});
+      const [form, setForm]               = useState({title:"",context:"@anywhere",dueDate:"",dueTime:"",startDate:"",waitingFor:"",energy:"",time:""});
+      const [enerF, setEnerF]             = useState("all");  // Next Actions engage filters
+      const [timeF, setTimeF]             = useState("all");
       const [procItem, setProcItem]       = useState(null);
       const [complCand, setComplCand]     = useState(null);
       const [promoteCand, setPromoteCand] = useState(null);  // next action → project
@@ -508,9 +514,9 @@
 
       const addItem = () => {
         if (!form.title.trim()) return;
-        const item = { ...mk(form.title), context:form.context, dueDate:form.dueDate, dueTime:form.dueDate?form.dueTime:"", startDate:form.startDate, waitingFor:form.waitingFor };
+        const item = { ...mk(form.title), context:form.context, dueDate:form.dueDate, dueTime:form.dueDate?form.dueTime:"", startDate:form.startDate, waitingFor:form.waitingFor, energy:active==="next"?form.energy:"", time:active==="next"?form.time:"" };
         upd({ ...items, [active]:[item,...items[active]] });
-        setForm({title:"",context:"@anywhere",dueDate:"",dueTime:"",startDate:"",waitingFor:""}); setShowForm(false);
+        setForm({title:"",context:"@anywhere",dueDate:"",dueTime:"",startDate:"",waitingFor:"",energy:"",time:""}); setShowForm(false);
       };
 
       const move = (from, id, to, patch={}) => {
@@ -538,7 +544,7 @@
         // base the merge on the STORED item (not the passed one) — Today/Calendar pass a
         // view object carrying _list/_kind that must not leak into persisted state.
         upd({ ...items, [list]: items[list].map(i => i.id===item.id
-          ? { ...i, title:newTitle, context:patch.context, dueDate:patch.dueDate, dueTime:patch.dueTime, startDate:patch.startDate, waitingFor:patch.waitingFor }
+          ? { ...i, title:newTitle, context:patch.context, dueDate:patch.dueDate, dueTime:patch.dueTime, startDate:patch.startDate, waitingFor:patch.waitingFor, energy:patch.energy, time:patch.time }
           : i) });
       };
 
@@ -593,7 +599,9 @@
       );
 
       const raw   = items[active] || [];
-      const shown = active==="next" && ctx!=="all" ? raw.filter(i=>i.context===ctx) : raw;
+      const shown = active==="next"
+        ? raw.filter(i => (ctx==="all"||i.context===ctx) && (enerF==="all"||i.energy===enerF) && (timeF==="all"||i.time===timeF))
+        : raw;
       const counts = Object.fromEntries(LISTS.map(l=>[l,(items[l]||[]).length]));
       const todayStart = new Date(); todayStart.setHours(0,0,0,0);
       const todayDone  = (items.done||[]).filter(i=>new Date(i.doneAt||i.created)>=todayStart).length;
@@ -728,13 +736,24 @@
             </div>
 
             {active==="next" && (
-              <div style={{padding:"8px 22px",background:"#fff",borderBottom:"1px solid #e2e8f0",display:"flex",gap:5,flexWrap:"wrap",flexShrink:0}}>
+              <div style={{padding:"8px 22px",background:"#fff",borderBottom:"1px solid #e2e8f0",display:"flex",gap:5,flexWrap:"wrap",alignItems:"center",flexShrink:0}}>
                 {["all",...CONTEXTS].map(c=>(
                   <button key={c} onClick={()=>setCtx(c)}
                     style={{padding:"3px 10px",borderRadius:20,border:`1px solid ${ctx===c?"#6366f1":"#e2e8f0"}`,background:ctx===c?"#6366f1":"#fff",color:ctx===c?"#fff":"#64748b",cursor:"pointer",fontSize:11,fontWeight:ctx===c?600:400}}>
                     {c==="all"?"All":c}
                   </button>
                 ))}
+                <span style={{width:1,height:18,background:"#e2e8f0",margin:"0 3px"}}/>
+                <select value={enerF} onChange={e=>setEnerF(e.target.value)} title="Filter by energy available"
+                  style={{padding:"3px 6px",borderRadius:20,border:`1px solid ${enerF!=="all"?"#6366f1":"#e2e8f0"}`,background:"#fff",color:enerF!=="all"?"#4338ca":"#64748b",cursor:"pointer",fontSize:11,fontWeight:enerF!=="all"?600:400}}>
+                  <option value="all">🔋 Any energy</option>
+                  {ENERGIES.map(e=><option key={e} value={e}>🔋 {e}</option>)}
+                </select>
+                <select value={timeF} onChange={e=>setTimeF(e.target.value)} title="Filter by time available"
+                  style={{padding:"3px 6px",borderRadius:20,border:`1px solid ${timeF!=="all"?"#6366f1":"#e2e8f0"}`,background:"#fff",color:timeF!=="all"?"#4338ca":"#64748b",cursor:"pointer",fontSize:11,fontWeight:timeF!=="all"?600:400}}>
+                  <option value="all">⏱ Any time</option>
+                  {TIMES.map(t=><option key={t} value={t}>⏱ {t}</option>)}
+                </select>
               </div>
             )}
 
@@ -749,6 +768,24 @@
                       style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff"}}>
                       {CONTEXTS.map(c=><option key={c}>{c}</option>)}
                     </select>
+                  )}
+                  {active==="next" && (
+                    <React.Fragment>
+                      <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Energy
+                        <select value={form.energy} onChange={e=>setForm({...form,energy:e.target.value})}
+                          style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff"}}>
+                          <option value="">—</option>
+                          {ENERGIES.map(en=><option key={en} value={en}>{en}</option>)}
+                        </select>
+                      </label>
+                      <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Time
+                        <select value={form.time} onChange={e=>setForm({...form,time:e.target.value})}
+                          style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff"}}>
+                          <option value="">—</option>
+                          {TIMES.map(t=><option key={t} value={t}>{t}</option>)}
+                        </select>
+                      </label>
+                    </React.Fragment>
                   )}
                   {active==="waiting" && (
                     <input value={form.waitingFor} onChange={e=>setForm({...form,waitingFor:e.target.value})}
@@ -1225,6 +1262,8 @@
             <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap"}}>
               {item.context&&item.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{item.context}</Tag>}
               {item.waitingFor&&<Tag bg="#fffbeb" c="#b45309">👤 {item.waitingFor}</Tag>}
+              {item.energy&&<Tag bg="#f1f5f9" c="#475569">🔋 {item.energy}</Tag>}
+              {item.time&&<Tag bg="#f1f5f9" c="#475569">⏱ {item.time}</Tag>}
               {item.startDate&&<Tag bg="#eff6ff" c="#1d4ed8">🕒 {item.startDate}</Tag>}
               {item.dueDate&&<Tag bg={ov?"#fef2f2":"#f0fdf4"} c={ov?"#b91c1c":"#166534"}>{ov?"⚠️ ":"📅 "}{dueLabel(item.dueDate,item.dueTime)}</Tag>}
               {item.doneAt&&<Tag bg="#f0fdf4" c="#166534">✓ {fmtDate(item.doneAt)}</Tag>}
@@ -1333,6 +1372,8 @@
                 <Tag bg="#eef2ff" c="#4338ca">{META[i._list].icon} {META[i._list].label}</Tag>
                 {i.context&&i.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{i.context}</Tag>}
                 {i.waitingFor&&<Tag bg="#fffbeb" c="#b45309">👤 {i.waitingFor}</Tag>}
+                {i.energy&&<Tag bg="#f1f5f9" c="#475569">🔋 {i.energy}</Tag>}
+                {i.time&&<Tag bg="#f1f5f9" c="#475569">⏱ {i.time}</Tag>}
                 {i.startDate&&<Tag bg="#eff6ff" c="#1d4ed8">🕒 {i.startDate}</Tag>}
                 {i.dueDate&&<Tag bg={ov?"#fef2f2":"#f0fdf4"} c={ov?"#b91c1c":"#166534"}>{ov?"⚠️ ":"📅 "}{dueLabel(i.dueDate,i.dueTime)}</Tag>}
               </div>
@@ -1883,11 +1924,13 @@
       const [dueTime,    setDueTime]    = useState(item.dueTime||"");
       const [startDate,  setStartDate]  = useState(item.startDate||"");
       const [waitingFor, setWaitingFor] = useState(item.waitingFor||"");
+      const [energy,     setEnergy]     = useState(item.energy||"");
+      const [time,       setTime]       = useState(item.time||"");
       const can = title.trim();
       const showCtx  = list==="next";
       const showWait = list==="waiting";
       const showDue  = ["next","projects","waiting","someday"].includes(list);
-      const confirm = () => { if (can) onConfirm({ title:title.trim(), context, dueDate, dueTime:dueDate?dueTime:"", startDate, waitingFor:waitingFor.trim(), pname }); };
+      const confirm = () => { if (can) onConfirm({ title:title.trim(), context, dueDate, dueTime:dueDate?dueTime:"", startDate, waitingFor:waitingFor.trim(), energy, time, pname }); };
       const overlay = {position:"fixed",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200};
       const box     = {background:"#fff",borderRadius:14,padding:22,width:420,maxWidth:"92vw",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
       const lbl     = {fontSize:10,fontWeight:700,color:"#94a3b8",textTransform:"uppercase",letterSpacing:".8px",marginBottom:6};
@@ -1910,6 +1953,22 @@
                   style={{...inp,marginBottom:14,background:"#fff"}}>
                   {CONTEXTS.map(c=><option key={c}>{c}</option>)}
                 </select>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+                  <div>
+                    <div style={lbl}>Energy</div>
+                    <select value={energy} onChange={e=>setEnergy(e.target.value)} style={{...inp,background:"#fff"}}>
+                      <option value="">—</option>
+                      {ENERGIES.map(en=><option key={en} value={en}>🔋 {en}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <div style={lbl}>Time needed</div>
+                    <select value={time} onChange={e=>setTime(e.target.value)} style={{...inp,background:"#fff"}}>
+                      <option value="">—</option>
+                      {TIMES.map(t=><option key={t} value={t}>⏱ {t}</option>)}
+                    </select>
+                  </div>
+                </div>
               </React.Fragment>
             )}
             {showWait&&(

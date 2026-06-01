@@ -64,7 +64,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v20";
+    const APP_VERSION = "v21";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     const LISTS    = ["inbox","next","projects","waiting","someday","reference","done"];
@@ -783,7 +783,7 @@
 
             <div style={{flex:1,overflowY:"auto",padding:"14px 22px"}}>
               {active==="today" ? (
-                <TodayView items={items} todayISO={todayISO}
+                <TodayView items={items} todayISO={todayISO} reviewDue={reviewDue} daysSinceReview={daysSinceReview}
                   onComplete={(list,item)=>setComplCand({list,item})}
                   onToggleFocus={toggleFocus}
                   onEdit={(list,item)=>setEditCand({list,item})}
@@ -1295,8 +1295,9 @@
     // "Focused today" = Next Actions you starred for today (ephemeral focusDate);
     // "Due today"/"Overdue" = the hard landscape (any dated list). Unfinished focus
     // simply isn't "today" tomorrow — it stays in Next Actions, no rollover guilt.
-    function TodayView({ items, todayISO, onComplete, onToggleFocus, onGoto, onEdit }) {
+    function TodayView({ items, todayISO, reviewDue, daysSinceReview, onComplete, onToggleFocus, onGoto, onEdit }) {
       const dateLabel = new Date(todayISO+"T00:00").toLocaleDateString("en-US",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
+      const [hideReview, setHideReview] = useState(false);
 
       // classify, deduped by id with priority overdue > focus > due > started
       const seen=new Set(), overdue=[], focus=[], due=[], started=[];
@@ -1369,6 +1370,21 @@
 
       return (
         <div>
+          {reviewDue && !hideReview && (
+            <div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 13px",marginBottom:14,background:"#fffbeb",border:"1px solid #fde68a",borderRadius:10}}>
+              <span style={{fontSize:18,flexShrink:0}}>🔄</span>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:12.5,fontWeight:600,color:"#92400e"}}>Time for your Weekly Review</div>
+                <div style={{fontSize:11,color:"#b45309",marginTop:1}}>
+                  {daysSinceReview===null ? "You haven't run one yet — it's the habit that keeps GTD trustworthy." : `It's been ${daysSinceReview} days. A quick pass keeps your system trustworthy.`}
+                </div>
+              </div>
+              <button onClick={()=>onGoto("review")}
+                style={{flexShrink:0,padding:"6px 12px",background:"#f59e0b",color:"#fff",border:"none",borderRadius:7,cursor:"pointer",fontSize:11,fontWeight:700}}>Start</button>
+              <button onClick={()=>setHideReview(true)} title="Dismiss for now"
+                style={{flexShrink:0,background:"none",border:"none",cursor:"pointer",color:"#b45309",fontSize:16,lineHeight:1,padding:"0 2px"}}>×</button>
+            </div>
+          )}
           <div style={{display:"flex",alignItems:"baseline",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:6}}>
             <div style={{fontSize:15,fontWeight:700}}>{dateLabel}</div>
             <div style={{fontSize:11,color:"#64748b"}}>{total} {total===1?"item":"items"} on deck</div>
@@ -2271,7 +2287,7 @@
 
     function EmptyState({ list, ctx }) {
       const m = {
-        inbox:     ["📥","Inbox zero!","Use Quick Capture to add items."],
+        inbox:     ["🎉","Inbox Zero!","Everything's captured and clarified. Mind like water."],
         next:      ["⚡","Clear horizons.","No next actions — process your inbox."],
         projects:  ["📋","No projects yet.","Add outcomes needing more than one step."],
         waiting:   ["⏳","Nothing waiting.","Track items you've delegated to others."],

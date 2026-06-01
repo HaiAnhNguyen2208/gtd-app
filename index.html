@@ -64,7 +64,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v16";
+    const APP_VERSION = "v17";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     const LISTS    = ["inbox","next","projects","waiting","someday","reference","done"];
@@ -91,12 +91,15 @@
 
     // ── Helpers ───────────────────────────────────────────────────
     const ts      = () => new Date().toISOString();
-    const mk      = t  => ({ id: Date.now()+Math.random(), title:t.trim(), created:ts(), context:"@anywhere", dueDate:"", waitingFor:"" });
+    const mk      = t  => ({ id: Date.now()+Math.random(), title:t.trim(), created:ts(), context:"@anywhere", dueDate:"", startDate:"", waitingFor:"" });
     const exProj  = t  => { const m=(t||"").match(/^\[([^\]]+)\]/); return m?m[1]:null; };
     const fmtDate = d  => { try{ return new Date(d).toLocaleDateString("vi-VN",{day:"2-digit",month:"2-digit",year:"numeric"}); }catch{return d||"";} };
     const isoDate = d  => { const x=new Date(d); return `${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,"0")}-${String(x.getDate()).padStart(2,"0")}`; };
     const relTime = t  => { if(!t) return ""; const s=Math.max(0,Math.floor((Date.now()-t)/1000)); if(s<60) return "just now"; const m=Math.floor(s/60); if(m<60) return m+"m ago"; const h=Math.floor(m/60); if(h<24) return h+"h ago"; return Math.floor(h/24)+"d ago"; };
     const isOver  = d  => d && new Date(d+"T23:59") < new Date();
+    // GTD tickler: an item with a future start date is "deferred" — hidden from the active
+    // Next Actions / Waiting / Today lists until its start day, then it resurfaces.
+    const isDeferred = (i, today) => i.startDate && i.startDate > today;
     const fresh   = () => ({ inbox:[], next:[], projects:[], waiting:[], someday:[], reference:[], done:[] });
     // Pick the candidate with the newest _updatedAt (strict — ties keep the earlier one,
     // so local wins ties and remotes are adopted only when genuinely newer).
@@ -296,7 +299,7 @@
       const [ctx, setCtx]                 = useState("all");
       const [capture, setCapture]         = useState("");
       const [showForm, setShowForm]       = useState(false);
-      const [form, setForm]               = useState({title:"",context:"@anywhere",dueDate:"",waitingFor:""});
+      const [form, setForm]               = useState({title:"",context:"@anywhere",dueDate:"",startDate:"",waitingFor:""});
       const [procItem, setProcItem]       = useState(null);
       const [complCand, setComplCand]     = useState(null);
       const [promoteCand, setPromoteCand] = useState(null);  // next action → project
@@ -499,9 +502,9 @@
 
       const addItem = () => {
         if (!form.title.trim()) return;
-        const item = { ...mk(form.title), context:form.context, dueDate:form.dueDate, waitingFor:form.waitingFor };
+        const item = { ...mk(form.title), context:form.context, dueDate:form.dueDate, startDate:form.startDate, waitingFor:form.waitingFor };
         upd({ ...items, [active]:[item,...items[active]] });
-        setForm({title:"",context:"@anywhere",dueDate:"",waitingFor:""}); setShowForm(false);
+        setForm({title:"",context:"@anywhere",dueDate:"",startDate:"",waitingFor:""}); setShowForm(false);
       };
 
       const move = (from, id, to, patch={}) => {
@@ -518,7 +521,7 @@
       const applyEdit = (list, item, patch) => {
         if (list==="projects") {
           const oldName=item.title, newName=patch.title;
-          const projects = items.projects.map(p => p.id===item.id ? {...p, title:newName, dueDate:patch.dueDate} : p);
+          const projects = items.projects.map(p => p.id===item.id ? {...p, title:newName, dueDate:patch.dueDate, startDate:patch.startDate} : p);
           if (oldName===newName) { upd({ ...items, projects }); return; }
           const relink = arr => arr.map(a =>
             exProj(a.title)===oldName ? { ...a, title:`[${newName}]${a.title.slice(oldName.length+2)}` } : a);
@@ -526,7 +529,7 @@
           return;
         }
         const newTitle = patch.pname ? `[${patch.pname}] ${patch.title}` : patch.title;
-        const updated = { ...item, title:newTitle, context:patch.context, dueDate:patch.dueDate, waitingFor:patch.waitingFor };
+        const updated = { ...item, title:newTitle, context:patch.context, dueDate:patch.dueDate, startDate:patch.startDate, waitingFor:patch.waitingFor };
         upd({ ...items, [list]: items[list].map(i => i.id===item.id ? updated : i) });
       };
 
@@ -587,9 +590,18 @@
       const todayDone  = (items.done||[]).filter(i=>new Date(i.doneAt||i.created)>=todayStart).length;
       const plannedCount = DATED.reduce((n,l)=>n+(items[l]||[]).filter(i=>i.dueDate).length,0);
       const todayISO = isoDate(new Date());
+      // GTD tickler: in the act-now lists, hide actions whose start date is still in the
+      // future — they live in a collapsed "Scheduled to start later" section and resurface
+      // automatically on their start day.
+      const canDefer     = active==="next" || active==="waiting";
+      const liveShown    = canDefer ? shown.filter(i=>!isDeferred(i,todayISO)) : shown;
+      const deferredShown = canDefer
+        ? shown.filter(i=>isDeferred(i,todayISO)).sort((a,b)=>a.startDate.localeCompare(b.startDate))
+        : [];
       const todayFocus = (() => {
         const seen=new Set(); let count=0, overdue=false;
         TODAY_LISTS.forEach(l=>(items[l]||[]).forEach(i=>{
+          if (isDeferred(i,todayISO)) return;   // tickler: not actionable yet
           const od  = i.dueDate && i.dueDate < todayISO;
           const due = i.dueDate === todayISO;
           const foc = l==="next" && i.focusDate === todayISO;
@@ -725,8 +737,16 @@
                       style={{flex:"1 1 130px",padding:"7px 10px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,outline:"none"}}/>
                   )}
                   {["next","projects","waiting"].includes(active) && (
-                    <input type="date" value={form.dueDate} onChange={e=>setForm({...form,dueDate:e.target.value})}
-                      style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+                    <React.Fragment>
+                      <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Start
+                        <input type="date" value={form.startDate} onChange={e=>setForm({...form,startDate:e.target.value})}
+                          style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+                      </label>
+                      <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Due
+                        <input type="date" value={form.dueDate} onChange={e=>setForm({...form,dueDate:e.target.value})}
+                          style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+                      </label>
+                    </React.Fragment>
                   )}
                   <button onClick={addItem}
                     style={{padding:"7px 16px",background:"#6366f1",color:"#fff",border:"none",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:600}}>
@@ -764,11 +784,11 @@
                   ? <EmptyState list="inbox"/>
                   : <InboxFocus item={shown[shown.length-1]} total={shown.length}
                       onProcess={()=>setProcItem(shown[shown.length-1])}/>
-              ) : shown.length===0 ? (
+              ) : (liveShown.length===0 && deferredShown.length===0) ? (
                 <EmptyState list={active} ctx={ctx}/>
               ) : (
                 <div style={{display:"flex",flexDirection:"column",gap:6}}>
-                  {shown.map(item=>(
+                  {liveShown.map(item=>(
                     <ItemCard key={item.id} item={item} list={active}
                       onComplete={()=>setComplCand({list:active,item})}
                       onDelete={()=>del(active,item.id)}
@@ -783,6 +803,23 @@
                       focused={active==="next" && item.focusDate===todayISO}
                       currentList={active}/>
                   ))}
+                  {deferredShown.length>0 && (
+                    <DeferredSection count={deferredShown.length}>
+                      {deferredShown.map(item=>(
+                        <ItemCard key={item.id} item={item} list={active}
+                          onComplete={()=>setComplCand({list:active,item})}
+                          onDelete={()=>del(active,item.id)}
+                          onProcess={null}
+                          onRestore={null}
+                          onMove={to=>upd({...items,[active]:items[active].filter(i=>i.id!==item.id),[to]:[item,...(items[to]||[])]})}
+                          onPromote={active==="next" ? ()=>setPromoteCand(item) : null}
+                          onEdit={()=>setEditCand({list:active,item})}
+                          onToggleFocus={null}
+                          focused={false}
+                          currentList={active}/>
+                      ))}
+                    </DeferredSection>
+                  )}
                 </div>
               )}
             </div>
@@ -839,7 +876,7 @@
                 const src = items.inbox.find(i=>i.id===procItem.id); if (!src) return;
                 let n = {...items, inbox:items.inbox.filter(i=>i.id!==procItem.id), projects:[{...src,...patch},...items.projects]};
                 if (first.type==="next") {
-                  const a = {...mk(`[${src.title}] ${first.title}`), context:first.context, dueDate:first.dueDate};
+                  const a = {...mk(`[${src.title}] ${first.title}`), context:first.context, dueDate:first.dueDate, startDate:first.startDate};
                   n = {...n, next:[a,...n.next]};
                 } else {
                   const w = {...mk(`[${src.title}] ${first.waitingFor}`), waitingFor:first.waitingFor};
@@ -1072,6 +1109,27 @@
       );
     }
 
+    // ── DeferredSection ───────────────────────────────────────────
+    // Collapsed drawer (GTD tickler) holding actions whose start date is still in the
+    // future. Hidden from the active list until they resurface on their start day.
+    function DeferredSection({ count, children }) {
+      const [open, setOpen] = useState(false);
+      return (
+        <div style={{marginTop:4,border:"1px dashed #cbd5e1",borderRadius:9,background:"#fafafa"}}>
+          <button onClick={()=>setOpen(o=>!o)}
+            style={{width:"100%",display:"flex",alignItems:"center",justifyContent:"space-between",padding:"9px 12px",background:"none",border:"none",cursor:"pointer",fontSize:11,fontWeight:700,color:"#64748b"}}>
+            <span>⏳ Scheduled to start later · {count}</span>
+            <span style={{fontSize:9}}>{open?"▲":"▼"}</span>
+          </button>
+          {open && (
+            <div style={{display:"flex",flexDirection:"column",gap:6,padding:"0 10px 10px"}}>
+              {children}
+            </div>
+          )}
+        </div>
+      );
+    }
+
     // ── ItemCard ──────────────────────────────────────────────────
     function ItemCard({ item, list, onComplete, onDelete, onProcess, onRestore, onMove, onPromote, onToggleFocus, onEdit, focused, currentList }) {
       const [menuPos, setMenuPos] = useState(null);   // {top|bottom, right} in viewport coords, or null = closed
@@ -1136,6 +1194,7 @@
             <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap"}}>
               {item.context&&item.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{item.context}</Tag>}
               {item.waitingFor&&<Tag bg="#fffbeb" c="#b45309">👤 {item.waitingFor}</Tag>}
+              {item.startDate&&<Tag bg="#eff6ff" c="#1d4ed8">🕒 {item.startDate}</Tag>}
               {item.dueDate&&<Tag bg={ov?"#fef2f2":"#f0fdf4"} c={ov?"#b91c1c":"#166534"}>{ov?"⚠️ ":"📅 "}{item.dueDate}</Tag>}
               {item.doneAt&&<Tag bg="#f0fdf4" c="#166534">✓ {fmtDate(item.doneAt)}</Tag>}
             </div>
@@ -1212,6 +1271,7 @@
       const seen=new Set(), overdue=[], focus=[], due=[];
       TODAY_LISTS.forEach(l=>(items[l]||[]).forEach(i=>{
         if (seen.has(i.id)) return;
+        if (isDeferred(i,todayISO)) return;   // tickler: deferred actions aren't "today"
         const it={...i,_list:l};
         if (i.dueDate && i.dueDate < todayISO)        { overdue.push(it); seen.add(i.id); }
         else if (l==="next" && i.focusDate===todayISO){ focus.push(it);   seen.add(i.id); }
@@ -1238,6 +1298,7 @@
                 <Tag bg="#eef2ff" c="#4338ca">{META[i._list].icon} {META[i._list].label}</Tag>
                 {i.context&&i.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{i.context}</Tag>}
                 {i.waitingFor&&<Tag bg="#fffbeb" c="#b45309">👤 {i.waitingFor}</Tag>}
+                {i.startDate&&<Tag bg="#eff6ff" c="#1d4ed8">🕒 {i.startDate}</Tag>}
                 {i.dueDate&&<Tag bg={ov?"#fef2f2":"#f0fdf4"} c={ov?"#b91c1c":"#166534"}>{ov?"⚠️ ":"📅 "}{i.dueDate}</Tag>}
               </div>
             </div>
@@ -1304,11 +1365,13 @@
       const [cursor,   setCursor]   = useState(() => new Date(today.getFullYear(), today.getMonth(), 1));
       const [selected, setSelected] = useState(todayISO);
 
-      // bucket every dated item by its YYYY-MM-DD due date
+      // bucket every dated item by its YYYY-MM-DD dates — a due date (deadline) on its due
+      // day and a start date (GTD tickler "defer until") on its start day. An item with both
+      // appears on both days; _kind distinguishes the marker/label.
       const byDate = {};
       DATED.forEach(l => (items[l]||[]).forEach(i => {
-        if (!i.dueDate) return;
-        (byDate[i.dueDate] = byDate[i.dueDate] || []).push({ ...i, _list:l });
+        if (i.dueDate)   (byDate[i.dueDate]   = byDate[i.dueDate]   || []).push({ ...i, _list:l, _kind:"due" });
+        if (i.startDate) (byDate[i.startDate] = byDate[i.startDate] || []).push({ ...i, _list:l, _kind:"start" });
       }));
 
       const y = cursor.getFullYear(), mo = cursor.getMonth();
@@ -1367,14 +1430,20 @@
                                   background:isToday?"#6366f1":"transparent",color:isToday?"#fff":"#475569"}}>{d.getDate()}</span>
                   </div>
                   <div style={{display:"flex",flexDirection:"column",gap:2,overflow:"hidden"}}>
-                    {dayList.slice(0,3).map(i=>(
-                      <div key={i.id} title={i.title}
-                        style={{display:"flex",alignItems:"center",gap:3,fontSize:9,lineHeight:1.2,color:overdue?"#b91c1c":"#334155",
+                    {dayList.slice(0,3).map(i=>{
+                      const isStart = i._kind==="start";
+                      const od = overdue && !isStart;   // a start day in the past isn't "overdue"
+                      return (
+                      <div key={i.id+i._kind} title={(isStart?"Starts: ":"")+i.title}
+                        style={{display:"flex",alignItems:"center",gap:3,fontSize:9,lineHeight:1.2,color:od?"#b91c1c":"#334155",
                                 whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
-                        <span style={{width:5,height:5,borderRadius:"50%",flexShrink:0,background:overdue?"#ef4444":dot[i._list]||"#94a3b8"}}/>
+                        <span style={{width:5,height:5,borderRadius:"50%",flexShrink:0,boxSizing:"border-box",
+                                      background:isStart?"transparent":(od?"#ef4444":dot[i._list]||"#94a3b8"),
+                                      border:isStart?"1.5px solid #1d4ed8":"none"}}/>
                         <span style={{overflow:"hidden",textOverflow:"ellipsis"}}>{i._list==="next"?(i.title.replace(/^\[[^\]]+\]\s*/,"")):i.title}</span>
                       </div>
-                    ))}
+                      );
+                    })}
                     {dayList.length>3 && <div style={{fontSize:9,color:"#94a3b8",fontWeight:600}}>+{dayList.length-3} more</div>}
                   </div>
                 </button>
@@ -1393,11 +1462,12 @@
             ) : (
               <div style={{display:"flex",flexDirection:"column",gap:6}}>
                 {selItems.map(i=>{
-                  const ov    = selected < todayISO;
+                  const isStart = i._kind==="start";
+                  const ov    = selected < todayISO && !isStart;   // a past start day isn't overdue
                   const pname = exProj(i.title);
                   const title = i._list==="next" && pname ? i.title.replace(/^\[[^\]]+\]\s*/,"") : i.title;
                   return (
-                    <div key={i.id}
+                    <div key={i.id+i._kind}
                       style={{display:"flex",alignItems:"flex-start",gap:10,padding:"9px 11px",border:`1px solid ${ov?"#fca5a5":"#e2e8f0"}`,borderRadius:9,background:ov?"#fff7f7":"#fff"}}>
                       {i._list!=="projects" ? (
                         <button onClick={()=>onComplete(i._list,{...i})} title="Mark done"
@@ -1412,6 +1482,7 @@
                           <Tag bg="#eef2ff" c="#4338ca">{META[i._list].icon} {META[i._list].label}</Tag>
                           {i.context&&i.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{i.context}</Tag>}
                           {i.waitingFor&&<Tag bg="#fffbeb" c="#b45309">👤 {i.waitingFor}</Tag>}
+                          {isStart&&<Tag bg="#eff6ff" c="#1d4ed8">🕒 starts</Tag>}
                           {ov&&<Tag bg="#fef2f2" c="#b91c1c">⚠️ overdue</Tag>}
                         </div>
                       </div>
@@ -1631,12 +1702,13 @@
       const [title,      setTitle]      = useState(list==="next"||list==="waiting" ? item.title.replace(/^\[[^\]]+\]\s*/,"") : item.title);
       const [context,    setContext]    = useState(item.context||"@anywhere");
       const [dueDate,    setDueDate]    = useState(item.dueDate||"");
+      const [startDate,  setStartDate]  = useState(item.startDate||"");
       const [waitingFor, setWaitingFor] = useState(item.waitingFor||"");
       const can = title.trim();
       const showCtx  = list==="next";
       const showWait = list==="waiting";
       const showDue  = ["next","projects","waiting","someday"].includes(list);
-      const confirm = () => { if (can) onConfirm({ title:title.trim(), context, dueDate, waitingFor:waitingFor.trim(), pname }); };
+      const confirm = () => { if (can) onConfirm({ title:title.trim(), context, dueDate, startDate, waitingFor:waitingFor.trim(), pname }); };
       const overlay = {position:"fixed",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200};
       const box     = {background:"#fff",borderRadius:14,padding:22,width:420,maxWidth:"92vw",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
       const lbl     = {fontSize:10,fontWeight:700,color:"#94a3b8",textTransform:"uppercase",letterSpacing:".8px",marginBottom:6};
@@ -1670,6 +1742,9 @@
             )}
             {showDue&&(
               <React.Fragment>
+                <div style={lbl}>Start date (defer until)</div>
+                <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)}
+                  style={{...inp,marginBottom:14}}/>
                 <div style={lbl}>Due date</div>
                 <input type="date" value={dueDate} onChange={e=>setDueDate(e.target.value)}
                   style={{...inp,marginBottom:14}}/>
@@ -1721,6 +1796,7 @@
       const [naTitle,   setNaTitle]   = useState("");
       const [naCtx,     setNaCtx]     = useState("@anywhere");
       const [naDue,     setNaDue]     = useState("");
+      const [naStart,   setNaStart]   = useState("");
       const [waitTxt,   setWaitTxt]   = useState("");
       const [secsLeft,  setSecsLeft]  = useState(120);
 
@@ -1792,7 +1868,7 @@
 
       if (phase==="next") {
         const can = naTitle.trim();
-        const confirm = () => { if (can) onMove("next", {title:naTitle.trim(), context:naCtx, dueDate:naDue}); };
+        const confirm = () => { if (can) onMove("next", {title:naTitle.trim(), context:naCtx, dueDate:naDue, startDate:naStart}); };
         return (
           <div style={overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
             <div style={box}>
@@ -1809,13 +1885,19 @@
                 onKeyDown={e=>e.key==="Enter"&&can&&confirm()}
                 placeholder="What is the very next physical action?"
                 style={{width:"100%",padding:"8px 10px",border:"1px solid #d1d5db",borderRadius:8,fontSize:13,outline:"none",marginBottom:8}}/>
+              <select value={naCtx} onChange={e=>setNaCtx(e.target.value)}
+                style={{width:"100%",padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff",marginBottom:8}}>
+                {CONTEXTS.map(c=><option key={c}>{c}</option>)}
+              </select>
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7,marginBottom:14}}>
-                <select value={naCtx} onChange={e=>setNaCtx(e.target.value)}
-                  style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff"}}>
-                  {CONTEXTS.map(c=><option key={c}>{c}</option>)}
-                </select>
-                <input type="date" value={naDue} onChange={e=>setNaDue(e.target.value)}
-                  style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+                <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Start (defer until)
+                  <input type="date" value={naStart} onChange={e=>setNaStart(e.target.value)}
+                    style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+                </label>
+                <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Due
+                  <input type="date" value={naDue} onChange={e=>setNaDue(e.target.value)}
+                    style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+                </label>
               </div>
               <button onClick={confirm} disabled={!can}
                 style={{width:"100%",padding:"10px",background:can?"#6366f1":"#e2e8f0",color:can?"#fff":"#94a3b8",
@@ -1831,7 +1913,7 @@
         const canConfirm = firstType==="next" ? naTitle.trim() : waitTxt.trim();
         const confirm = () => {
           const first = firstType==="next"
-            ? {type:"next", title:naTitle.trim(), context:naCtx, dueDate:naDue}
+            ? {type:"next", title:naTitle.trim(), context:naCtx, dueDate:naDue, startDate:naStart}
             : {type:"waiting", waitingFor:waitTxt.trim()};
           onMoveAsProject({dueDate:due}, first);
         };
@@ -1854,13 +1936,19 @@
                     onKeyDown={e=>e.key==="Enter"&&canConfirm&&confirm()}
                     placeholder="What is the very next physical action?"
                     style={{width:"100%",padding:"8px 10px",border:"1px solid #d1d5db",borderRadius:8,fontSize:13,outline:"none",marginBottom:8}}/>
+                  <select value={naCtx} onChange={e=>setNaCtx(e.target.value)}
+                    style={{width:"100%",padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff",marginBottom:8}}>
+                    {CONTEXTS.map(c=><option key={c}>{c}</option>)}
+                  </select>
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7,marginBottom:14}}>
-                    <select value={naCtx} onChange={e=>setNaCtx(e.target.value)}
-                      style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff"}}>
-                      {CONTEXTS.map(c=><option key={c}>{c}</option>)}
-                    </select>
-                    <input type="date" value={naDue} onChange={e=>setNaDue(e.target.value)}
-                      style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+                    <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Start (defer until)
+                      <input type="date" value={naStart} onChange={e=>setNaStart(e.target.value)}
+                        style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+                    </label>
+                    <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Due
+                      <input type="date" value={naDue} onChange={e=>setNaDue(e.target.value)}
+                        style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+                    </label>
                   </div>
                 </div>
               ) : (
@@ -1892,8 +1980,8 @@
                 ✅ Do it now — under 2 minutes
                 <div style={{fontSize:10,fontWeight:400,color:"#10b981",marginTop:2}}>Starts a 2-min timer — mark done when finished</div>
               </button>
-              <Opt bg="#f5f3ff" border="#c4b5fd" color="#5b21b6" onClick={()=>{setNaTitle(item.title);setNaCtx("@anywhere");setNaDue("");setPhase("next");}}>⚡ Next Action — you do it</Opt>
-              <Opt bg="#f5f3ff" border="#ddd6fe" color="#4338ca" onClick={()=>{setNaTitle("");setNaCtx("@anywhere");setNaDue("");setPhase("project");}}>📋 Project — multiple steps needed</Opt>
+              <Opt bg="#f5f3ff" border="#c4b5fd" color="#5b21b6" onClick={()=>{setNaTitle(item.title);setNaCtx("@anywhere");setNaDue("");setNaStart("");setPhase("next");}}>⚡ Next Action — you do it</Opt>
+              <Opt bg="#f5f3ff" border="#ddd6fe" color="#4338ca" onClick={()=>{setNaTitle("");setNaCtx("@anywhere");setNaDue("");setNaStart("");setPhase("project");}}>📋 Project — multiple steps needed</Opt>
               <input value={from} onChange={e=>setFrom(e.target.value)} placeholder="Waiting from whom?"
                 style={{padding:"7px 10px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,outline:"none"}}/>
               <input type="date" value={due} onChange={e=>setDue(e.target.value)}

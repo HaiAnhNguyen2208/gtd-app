@@ -113,7 +113,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v24";
+    const APP_VERSION = "v25";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     // GTD's other two "engage" criteria beyond context: energy available and time at hand.
@@ -786,16 +786,10 @@
               </div>
               <div style={{display:"flex",gap:6,alignItems:"center"}}>
                 {history.length > 0 && (
-                  <button onClick={undo} title="Undo (Ctrl+Z)"
-                    style={{padding:"7px 12px",background:"#fff",color:"#475569",border:"1px solid #e2e8f0",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:500}}>
-                    ↩ Undo
-                  </button>
+                  <button onClick={undo} title="Undo (Ctrl+Z)" className="btn btn-ghost btn-sm">↩ Undo</button>
                 )}
                 {active!=="done" && active!=="calendar" && active!=="today" && active!=="review" && (
-                  <button onClick={()=>setShowForm(s=>!s)}
-                    style={{padding:"7px 14px",background:"#6366f1",color:"#fff",border:"none",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:600}}>
-                    {showForm?"Cancel":"+ Add"}
-                  </button>
+                  <button onClick={()=>setShowForm(s=>!s)} className="btn btn-pri btn-sm">{showForm?"Cancel":"+ Add"}</button>
                 )}
               </div>
             </div>
@@ -1444,15 +1438,9 @@
               </button>
             )}
             {onEdit && i._list!=="projects" && (
-              <button onClick={()=>onEdit(i._list,i)} title="Edit"
-                style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:13,lineHeight:1,padding:"0 2px",flexShrink:0}}
-                onMouseEnter={e=>e.currentTarget.style.color="#6366f1"}
-                onMouseLeave={e=>e.currentTarget.style.color="#94a3b8"}>✎</button>
+              <button onClick={()=>onEdit(i._list,i)} title="Edit" className="ibtn" style={{fontSize:13,flexShrink:0}}>✎</button>
             )}
-            <button onClick={()=>onGoto(i._list)} title={"Open "+META[i._list].label}
-              style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:14,lineHeight:1,padding:"0 2px",flexShrink:0}}
-              onMouseEnter={e=>e.currentTarget.style.color="#6366f1"}
-              onMouseLeave={e=>e.currentTarget.style.color="#94a3b8"}>↗</button>
+            <button onClick={()=>onGoto(i._list)} title={"Open "+META[i._list].label} className="ibtn" style={{fontSize:14,flexShrink:0}}>↗</button>
           </div>
         );
       };
@@ -1756,9 +1744,7 @@
                       </div>
                       {s.goto && (
                         <button onClick={()=>onGoto(s.goto)} title={"Open "+(META[s.goto]?.label||s.goto)}
-                          style={{background:"none",border:"1px solid #e2e8f0",borderRadius:7,cursor:"pointer",color:"#475569",fontSize:11,fontWeight:600,padding:"4px 9px",flexShrink:0,whiteSpace:"nowrap"}}
-                          onMouseEnter={e=>e.currentTarget.style.borderColor="#6366f1"}
-                          onMouseLeave={e=>e.currentTarget.style.borderColor="#e2e8f0"}>Open →</button>
+                          className="btn btn-ghost btn-sm" style={{flexShrink:0,whiteSpace:"nowrap"}}>Open →</button>
                       )}
                     </div>
                   );
@@ -1788,7 +1774,7 @@
       const [waitingFor, setWaitingFor] = useState("");
 
       const overlay = {position:"fixed",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200};
-      const box     = {background:"#fff",borderRadius:14,padding:22,width:420,maxWidth:"92vw",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
+      const box     = {background:"#fff",borderRadius:14,padding:22,width:420,maxWidth:"92vw",maxHeight:"92vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
 
       if (phase==="simple") return (
         <div style={overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
@@ -1937,11 +1923,9 @@
       const [outcome, setOutcome] = useState("");
       const can = outcome.trim();
       const confirm = () => { if (can) onConfirm(outcome.trim()); };
-      const overlay = {position:"fixed",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200};
-      const box     = {background:"#fff",borderRadius:14,padding:22,width:420,maxWidth:"92vw",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
       return (
-        <div style={overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
-          <div style={box}>
+        <div className="ov" onClick={e=>e.target===e.currentTarget&&onClose()}>
+          <div className="mbox">
             <div style={{fontSize:14,fontWeight:700,marginBottom:3}}>Make into a project</div>
             <div style={{fontSize:11,color:"#64748b",marginBottom:14}}>
               GTD: a project is a multi-step outcome. This action stays on as its first next action.
@@ -1952,19 +1936,12 @@
             <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",textTransform:"uppercase",letterSpacing:".8px",marginBottom:6}}>
               Project outcome — what does "done" look like?
             </div>
-            <input autoFocus value={outcome} onChange={e=>setOutcome(e.target.value)}
+            <input autoFocus className="in" style={{marginBottom:14}} value={outcome} onChange={e=>setOutcome(e.target.value)}
               onKeyDown={e=>e.key==="Enter"&&can&&confirm()}
-              placeholder="e.g. Bathroom leak fully fixed"
-              style={{width:"100%",padding:"8px 10px",border:"1px solid #d1d5db",borderRadius:8,fontSize:13,outline:"none",marginBottom:14}}/>
+              placeholder="e.g. Bathroom leak fully fixed"/>
             <div style={{display:"flex",gap:8}}>
-              <button onClick={confirm} disabled={!can}
-                style={{flex:1,padding:"10px",background:can?"#6366f1":"#e2e8f0",color:can?"#fff":"#94a3b8",border:"none",borderRadius:8,cursor:can?"pointer":"default",fontSize:13,fontWeight:600}}>
-                📋 Create project
-              </button>
-              <button onClick={onClose}
-                style={{flex:1,padding:"10px",background:"transparent",border:"1px solid #e2e8f0",borderRadius:8,cursor:"pointer",fontSize:13,color:"#64748b"}}>
-                Cancel
-              </button>
+              <button onClick={confirm} disabled={!can} className="btn btn-pri" style={{flex:1}}>📋 Create project</button>
+              <button onClick={onClose} className="btn btn-ghost" style={{flex:1}}>Cancel</button>
             </div>
           </div>
         </div>
@@ -1990,39 +1967,34 @@
       const showWait = list==="waiting";
       const showDue  = ["next","projects","waiting","someday"].includes(list);
       const confirm = () => { if (can) onConfirm({ title:title.trim(), context, dueDate, dueTime:dueDate?dueTime:"", startDate, waitingFor:waitingFor.trim(), energy, time, pname }); };
-      const overlay = {position:"fixed",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200};
-      const box     = {background:"#fff",borderRadius:14,padding:22,width:420,maxWidth:"92vw",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
-      const lbl     = {fontSize:10,fontWeight:700,color:"#94a3b8",textTransform:"uppercase",letterSpacing:".8px",marginBottom:6};
-      const inp     = {width:"100%",padding:"8px 10px",border:"1px solid #d1d5db",borderRadius:8,fontSize:13,outline:"none"};
+      const lbl = {marginBottom:6};
       return (
-        <div style={overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
-          <div style={box}>
+        <div className="ov" onClick={e=>e.target===e.currentTarget&&onClose()}>
+          <div className="mbox">
             <div style={{fontSize:14,fontWeight:700,marginBottom:14}}>Edit {META[list]?.label||"item"}</div>
             {pname&&(list==="next"||list==="waiting")&&(
               <div style={{fontSize:11,color:"#7c3aed",fontWeight:600,marginBottom:10}}>📋 {pname}</div>
             )}
-            <div style={lbl}>{list==="projects"?"Project outcome":"Title"}</div>
-            <input autoFocus value={title} onChange={e=>setTitle(e.target.value)}
-              onKeyDown={e=>e.key==="Enter"&&can&&confirm()}
-              style={{...inp,marginBottom:14}}/>
+            <div className="slabel" style={lbl}>{list==="projects"?"Project outcome":"Title"}</div>
+            <input autoFocus className="in" style={{marginBottom:14}} value={title} onChange={e=>setTitle(e.target.value)}
+              onKeyDown={e=>e.key==="Enter"&&can&&confirm()}/>
             {showCtx&&(
               <React.Fragment>
-                <div style={lbl}>Context</div>
-                <select value={context} onChange={e=>setContext(e.target.value)}
-                  style={{...inp,marginBottom:14,background:"#fff"}}>
+                <div className="slabel" style={lbl}>Context</div>
+                <select className="in" style={{marginBottom:14}} value={context} onChange={e=>setContext(e.target.value)}>
                   {CONTEXTS.map(c=><option key={c}>{c}</option>)}
                 </select>
                 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
                   <div>
-                    <div style={lbl}>Energy</div>
-                    <select value={energy} onChange={e=>setEnergy(e.target.value)} style={{...inp,background:"#fff"}}>
+                    <div className="slabel" style={lbl}>Energy</div>
+                    <select className="in" value={energy} onChange={e=>setEnergy(e.target.value)}>
                       <option value="">—</option>
                       {ENERGIES.map(en=><option key={en} value={en}>🔋 {en}</option>)}
                     </select>
                   </div>
                   <div>
-                    <div style={lbl}>Time needed</div>
-                    <select value={time} onChange={e=>setTime(e.target.value)} style={{...inp,background:"#fff"}}>
+                    <div className="slabel" style={lbl}>Time needed</div>
+                    <select className="in" value={time} onChange={e=>setTime(e.target.value)}>
                       <option value="">—</option>
                       {TIMES.map(t=><option key={t} value={t}>⏱ {t}</option>)}
                     </select>
@@ -2032,37 +2004,27 @@
             )}
             {showWait&&(
               <React.Fragment>
-                <div style={lbl}>Waiting for whom?</div>
-                <input value={waitingFor} onChange={e=>setWaitingFor(e.target.value)}
-                  style={{...inp,marginBottom:14}}/>
+                <div className="slabel" style={lbl}>Waiting for whom?</div>
+                <input className="in" style={{marginBottom:14}} value={waitingFor} onChange={e=>setWaitingFor(e.target.value)}/>
               </React.Fragment>
             )}
             {showDue&&(
               <React.Fragment>
-                <div style={lbl}>Start date (defer until)</div>
-                <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)}
-                  style={{...inp,marginBottom:14}}/>
-                <div style={lbl}>Due date</div>
-                <input type="date" value={dueDate} onChange={e=>{setDueDate(e.target.value); if(!e.target.value) setDueTime("");}}
-                  style={{...inp,marginBottom:dueDate?8:14}}/>
+                <div className="slabel" style={lbl}>Start date (defer until)</div>
+                <input className="in" style={{marginBottom:14}} type="date" value={startDate} onChange={e=>setStartDate(e.target.value)}/>
+                <div className="slabel" style={lbl}>Due date</div>
+                <input className="in" style={{marginBottom:dueDate?8:14}} type="date" value={dueDate} onChange={e=>{setDueDate(e.target.value); if(!e.target.value) setDueTime("");}}/>
                 {dueDate&&(
                   <React.Fragment>
-                    <div style={lbl}>Due time <span style={{textTransform:"none",fontWeight:400,color:"#cbd5e1"}}>· optional, for appointments</span></div>
-                    <input type="time" value={dueTime} onChange={e=>setDueTime(e.target.value)}
-                      style={{...inp,marginBottom:14}}/>
+                    <div className="slabel" style={lbl}>Due time <span style={{textTransform:"none",fontWeight:400,color:"#cbd5e1"}}>· optional, for appointments</span></div>
+                    <input className="in" style={{marginBottom:14}} type="time" value={dueTime} onChange={e=>setDueTime(e.target.value)}/>
                   </React.Fragment>
                 )}
               </React.Fragment>
             )}
             <div style={{display:"flex",gap:8}}>
-              <button onClick={confirm} disabled={!can}
-                style={{flex:1,padding:"10px",background:can?"#6366f1":"#e2e8f0",color:can?"#fff":"#94a3b8",border:"none",borderRadius:8,cursor:can?"pointer":"default",fontSize:13,fontWeight:600}}>
-                Save
-              </button>
-              <button onClick={onClose}
-                style={{flex:1,padding:"10px",background:"transparent",border:"1px solid #e2e8f0",borderRadius:8,cursor:"pointer",fontSize:13,color:"#64748b"}}>
-                Cancel
-              </button>
+              <button onClick={confirm} disabled={!can} className="btn btn-pri" style={{flex:1}}>Save</button>
+              <button onClick={onClose} className="btn btn-ghost" style={{flex:1}}>Cancel</button>
             </div>
           </div>
         </div>
@@ -2113,7 +2075,7 @@
       }, [phase]);
 
       const overlay = {position:"fixed",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200};
-      const box     = {background:"#fff",borderRadius:14,padding:22,width:420,maxWidth:"92vw",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
+      const box     = {background:"#fff",borderRadius:14,padding:22,width:420,maxWidth:"92vw",maxHeight:"92vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
 
       const Opt = ({ bg, border, color, onClick, children }) => (
         <button onClick={onClick}

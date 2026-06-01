@@ -64,7 +64,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v17";
+    const APP_VERSION = "v18";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     const LISTS    = ["inbox","next","projects","waiting","someday","reference","done"];
@@ -1267,17 +1267,19 @@
     function TodayView({ items, todayISO, onComplete, onToggleFocus, onGoto }) {
       const dateLabel = new Date(todayISO+"T00:00").toLocaleDateString("en-US",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
 
-      // classify, deduped by id with priority overdue > focus > due
-      const seen=new Set(), overdue=[], focus=[], due=[];
+      // classify, deduped by id with priority overdue > focus > due > started
+      const seen=new Set(), overdue=[], focus=[], due=[], started=[];
       TODAY_LISTS.forEach(l=>(items[l]||[]).forEach(i=>{
         if (seen.has(i.id)) return;
-        if (isDeferred(i,todayISO)) return;   // tickler: deferred actions aren't "today"
+        if (isDeferred(i,todayISO)) return;   // tickler: actions deferred to a FUTURE day aren't "today"
         const it={...i,_list:l};
         if (i.dueDate && i.dueDate < todayISO)        { overdue.push(it); seen.add(i.id); }
         else if (l==="next" && i.focusDate===todayISO){ focus.push(it);   seen.add(i.id); }
         else if (i.dueDate===todayISO)                { due.push(it);     seen.add(i.id); }
+        // tickler fired: its start date has arrived (today or earlier) — surface it as on-deck
+        else if (i.startDate && i.startDate<=todayISO){ started.push(it); seen.add(i.id); }
       }));
-      const total = overdue.length + focus.length + due.length;
+      const total = overdue.length + focus.length + due.length + started.length;
 
       const Row = ({ i, ov }) => {
         const pname = exProj(i.title);
@@ -1345,9 +1347,10 @@
             </div>
           ) : (
             <React.Fragment>
-              <Section label="⚠️ Overdue"        list={overdue} ov={true}/>
-              <Section label="🎯 Focused today"  list={focus}   ov={false}/>
-              <Section label="📅 Due today"      list={due}     ov={false}/>
+              <Section label="⚠️ Overdue"          list={overdue} ov={true}/>
+              <Section label="🎯 Focused today"    list={focus}   ov={false}/>
+              <Section label="📅 Due today"        list={due}     ov={false}/>
+              <Section label="🚀 Ready to start"   list={started} ov={false}/>
             </React.Fragment>
           )}
         </div>

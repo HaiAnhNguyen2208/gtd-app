@@ -64,7 +64,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v18";
+    const APP_VERSION = "v19";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     const LISTS    = ["inbox","next","projects","waiting","someday","reference","done"];
@@ -91,9 +91,13 @@
 
     // ── Helpers ───────────────────────────────────────────────────
     const ts      = () => new Date().toISOString();
-    const mk      = t  => ({ id: Date.now()+Math.random(), title:t.trim(), created:ts(), context:"@anywhere", dueDate:"", startDate:"", waitingFor:"" });
+    const mk      = t  => ({ id: Date.now()+Math.random(), title:t.trim(), created:ts(), context:"@anywhere", dueDate:"", dueTime:"", startDate:"", waitingFor:"" });
     const exProj  = t  => { const m=(t||"").match(/^\[([^\]]+)\]/); return m?m[1]:null; };
     const fmtDate = d  => { try{ return new Date(d).toLocaleDateString("vi-VN",{day:"2-digit",month:"2-digit",year:"numeric"}); }catch{return d||"";} };
+    // "HH:MM" (24h) → "h:mm AM/PM"; blank stays blank. Optional time turns a due DATE into a
+    // true time-specific appointment (GTD hard landscape). A bare date stays day-scale.
+    const fmtTime = t  => { if(!t) return ""; const [h,m]=t.split(":").map(Number); const ap=h<12?"AM":"PM"; const h12=h%12||12; return `${h12}:${String(m).padStart(2,"0")} ${ap}`; };
+    const dueLabel= (d,tm) => d ? (tm ? `${d} ${fmtTime(tm)}` : d) : "";
     const isoDate = d  => { const x=new Date(d); return `${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,"0")}-${String(x.getDate()).padStart(2,"0")}`; };
     const relTime = t  => { if(!t) return ""; const s=Math.max(0,Math.floor((Date.now()-t)/1000)); if(s<60) return "just now"; const m=Math.floor(s/60); if(m<60) return m+"m ago"; const h=Math.floor(m/60); if(h<24) return h+"h ago"; return Math.floor(h/24)+"d ago"; };
     const isOver  = d  => d && new Date(d+"T23:59") < new Date();
@@ -299,7 +303,7 @@
       const [ctx, setCtx]                 = useState("all");
       const [capture, setCapture]         = useState("");
       const [showForm, setShowForm]       = useState(false);
-      const [form, setForm]               = useState({title:"",context:"@anywhere",dueDate:"",startDate:"",waitingFor:""});
+      const [form, setForm]               = useState({title:"",context:"@anywhere",dueDate:"",dueTime:"",startDate:"",waitingFor:""});
       const [procItem, setProcItem]       = useState(null);
       const [complCand, setComplCand]     = useState(null);
       const [promoteCand, setPromoteCand] = useState(null);  // next action → project
@@ -502,9 +506,9 @@
 
       const addItem = () => {
         if (!form.title.trim()) return;
-        const item = { ...mk(form.title), context:form.context, dueDate:form.dueDate, startDate:form.startDate, waitingFor:form.waitingFor };
+        const item = { ...mk(form.title), context:form.context, dueDate:form.dueDate, dueTime:form.dueDate?form.dueTime:"", startDate:form.startDate, waitingFor:form.waitingFor };
         upd({ ...items, [active]:[item,...items[active]] });
-        setForm({title:"",context:"@anywhere",dueDate:"",startDate:"",waitingFor:""}); setShowForm(false);
+        setForm({title:"",context:"@anywhere",dueDate:"",dueTime:"",startDate:"",waitingFor:""}); setShowForm(false);
       };
 
       const move = (from, id, to, patch={}) => {
@@ -521,7 +525,7 @@
       const applyEdit = (list, item, patch) => {
         if (list==="projects") {
           const oldName=item.title, newName=patch.title;
-          const projects = items.projects.map(p => p.id===item.id ? {...p, title:newName, dueDate:patch.dueDate, startDate:patch.startDate} : p);
+          const projects = items.projects.map(p => p.id===item.id ? {...p, title:newName, dueDate:patch.dueDate, dueTime:patch.dueTime, startDate:patch.startDate} : p);
           if (oldName===newName) { upd({ ...items, projects }); return; }
           const relink = arr => arr.map(a =>
             exProj(a.title)===oldName ? { ...a, title:`[${newName}]${a.title.slice(oldName.length+2)}` } : a);
@@ -529,8 +533,11 @@
           return;
         }
         const newTitle = patch.pname ? `[${patch.pname}] ${patch.title}` : patch.title;
-        const updated = { ...item, title:newTitle, context:patch.context, dueDate:patch.dueDate, startDate:patch.startDate, waitingFor:patch.waitingFor };
-        upd({ ...items, [list]: items[list].map(i => i.id===item.id ? updated : i) });
+        // base the merge on the STORED item (not the passed one) — Today/Calendar pass a
+        // view object carrying _list/_kind that must not leak into persisted state.
+        upd({ ...items, [list]: items[list].map(i => i.id===item.id
+          ? { ...i, title:newTitle, context:patch.context, dueDate:patch.dueDate, dueTime:patch.dueTime, startDate:patch.startDate, waitingFor:patch.waitingFor }
+          : i) });
       };
 
       // Star/un-star a Next Action as today's focus (ephemeral, dated — see TodayView).
@@ -743,9 +750,15 @@
                           style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
                       </label>
                       <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Due
-                        <input type="date" value={form.dueDate} onChange={e=>setForm({...form,dueDate:e.target.value})}
+                        <input type="date" value={form.dueDate} onChange={e=>setForm({...form,dueDate:e.target.value,dueTime:e.target.value?form.dueTime:""})}
                           style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
                       </label>
+                      {form.dueDate && (
+                        <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}} title="Optional — set a time only for a real appointment">Time
+                          <input type="time" value={form.dueTime} onChange={e=>setForm({...form,dueTime:e.target.value})}
+                            style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+                        </label>
+                      )}
                     </React.Fragment>
                   )}
                   <button onClick={addItem}
@@ -761,10 +774,12 @@
                 <TodayView items={items} todayISO={todayISO}
                   onComplete={(list,item)=>setComplCand({list,item})}
                   onToggleFocus={toggleFocus}
+                  onEdit={(list,item)=>setEditCand({list,item})}
                   onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}/>
               ) : active==="calendar" ? (
                 <CalendarView items={items}
                   onComplete={(list,item)=>setComplCand({list,item})}
+                  onEdit={(list,item)=>setEditCand({list,item})}
                   onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}/>
               ) : active==="projects" ? (
                 shown.length===0
@@ -876,7 +891,7 @@
                 const src = items.inbox.find(i=>i.id===procItem.id); if (!src) return;
                 let n = {...items, inbox:items.inbox.filter(i=>i.id!==procItem.id), projects:[{...src,...patch},...items.projects]};
                 if (first.type==="next") {
-                  const a = {...mk(`[${src.title}] ${first.title}`), context:first.context, dueDate:first.dueDate, startDate:first.startDate};
+                  const a = {...mk(`[${src.title}] ${first.title}`), context:first.context, dueDate:first.dueDate, dueTime:first.dueTime||"", startDate:first.startDate};
                   n = {...n, next:[a,...n.next]};
                 } else {
                   const w = {...mk(`[${src.title}] ${first.waitingFor}`), waitingFor:first.waitingFor};
@@ -1088,7 +1103,7 @@
                         </div>
                         <div style={{display:"flex",gap:5,marginTop:3,flexWrap:"wrap"}}>
                           {a.context&&a.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{a.context}</Tag>}
-                          {a.dueDate&&<Tag bg={isOver(a.dueDate)?"#fef2f2":"#f0fdf4"} c={isOver(a.dueDate)?"#b91c1c":"#166534"}>{isOver(a.dueDate)?"⚠️ ":"📅 "}{a.dueDate}</Tag>}
+                          {a.dueDate&&<Tag bg={isOver(a.dueDate)?"#fef2f2":"#f0fdf4"} c={isOver(a.dueDate)?"#b91c1c":"#166534"}>{isOver(a.dueDate)?"⚠️ ":"📅 "}{dueLabel(a.dueDate,a.dueTime)}</Tag>}
                         </div>
                       </div>
                       <button onClick={()=>onDeleteAction(a.id)}
@@ -1195,7 +1210,7 @@
               {item.context&&item.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{item.context}</Tag>}
               {item.waitingFor&&<Tag bg="#fffbeb" c="#b45309">👤 {item.waitingFor}</Tag>}
               {item.startDate&&<Tag bg="#eff6ff" c="#1d4ed8">🕒 {item.startDate}</Tag>}
-              {item.dueDate&&<Tag bg={ov?"#fef2f2":"#f0fdf4"} c={ov?"#b91c1c":"#166534"}>{ov?"⚠️ ":"📅 "}{item.dueDate}</Tag>}
+              {item.dueDate&&<Tag bg={ov?"#fef2f2":"#f0fdf4"} c={ov?"#b91c1c":"#166534"}>{ov?"⚠️ ":"📅 "}{dueLabel(item.dueDate,item.dueTime)}</Tag>}
               {item.doneAt&&<Tag bg="#f0fdf4" c="#166534">✓ {fmtDate(item.doneAt)}</Tag>}
             </div>
           </div>
@@ -1264,7 +1279,7 @@
     // "Focused today" = Next Actions you starred for today (ephemeral focusDate);
     // "Due today"/"Overdue" = the hard landscape (any dated list). Unfinished focus
     // simply isn't "today" tomorrow — it stays in Next Actions, no rollover guilt.
-    function TodayView({ items, todayISO, onComplete, onToggleFocus, onGoto }) {
+    function TodayView({ items, todayISO, onComplete, onToggleFocus, onGoto, onEdit }) {
       const dateLabel = new Date(todayISO+"T00:00").toLocaleDateString("en-US",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
 
       // classify, deduped by id with priority overdue > focus > due > started
@@ -1279,6 +1294,7 @@
         // tickler fired: its start date has arrived (today or earlier) — surface it as on-deck
         else if (i.startDate && i.startDate<=todayISO){ started.push(it); seen.add(i.id); }
       }));
+      due.sort((a,b)=>(a.dueTime||"24:00").localeCompare(b.dueTime||"24:00"));   // timed appointments first
       const total = overdue.length + focus.length + due.length + started.length;
 
       const Row = ({ i, ov }) => {
@@ -1301,7 +1317,7 @@
                 {i.context&&i.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{i.context}</Tag>}
                 {i.waitingFor&&<Tag bg="#fffbeb" c="#b45309">👤 {i.waitingFor}</Tag>}
                 {i.startDate&&<Tag bg="#eff6ff" c="#1d4ed8">🕒 {i.startDate}</Tag>}
-                {i.dueDate&&<Tag bg={ov?"#fef2f2":"#f0fdf4"} c={ov?"#b91c1c":"#166534"}>{ov?"⚠️ ":"📅 "}{i.dueDate}</Tag>}
+                {i.dueDate&&<Tag bg={ov?"#fef2f2":"#f0fdf4"} c={ov?"#b91c1c":"#166534"}>{ov?"⚠️ ":"📅 "}{dueLabel(i.dueDate,i.dueTime)}</Tag>}
               </div>
             </div>
             {i._list==="next" && onToggleFocus && (
@@ -1309,6 +1325,12 @@
                 style={{background:"none",border:"none",cursor:"pointer",color:foc?"#f59e0b":"#cbd5e1",fontSize:15,lineHeight:1,padding:"0 1px",flexShrink:0}}>
                 {foc?"★":"☆"}
               </button>
+            )}
+            {onEdit && i._list!=="projects" && (
+              <button onClick={()=>onEdit(i._list,i)} title="Edit"
+                style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:13,lineHeight:1,padding:"0 2px",flexShrink:0}}
+                onMouseEnter={e=>e.currentTarget.style.color="#6366f1"}
+                onMouseLeave={e=>e.currentTarget.style.color="#94a3b8"}>✎</button>
             )}
             <button onClick={()=>onGoto(i._list)} title={"Open "+META[i._list].label}
               style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:14,lineHeight:1,padding:"0 2px",flexShrink:0}}
@@ -1362,7 +1384,7 @@
     // Read-mostly: click a day to inspect its items; complete or jump to the source
     // list from the day panel. Not a stored list — derives entirely from `items`.
     const WEEKDAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
-    function CalendarView({ items, onComplete, onGoto }) {
+    function CalendarView({ items, onComplete, onGoto, onEdit }) {
       const today = new Date(); today.setHours(0,0,0,0);
       const todayISO = isoDate(today);
       const [cursor,   setCursor]   = useState(() => new Date(today.getFullYear(), today.getMonth(), 1));
@@ -1376,6 +1398,9 @@
         if (i.dueDate)   (byDate[i.dueDate]   = byDate[i.dueDate]   || []).push({ ...i, _list:l, _kind:"due" });
         if (i.startDate) (byDate[i.startDate] = byDate[i.startDate] || []).push({ ...i, _list:l, _kind:"start" });
       }));
+      // within a day: timed appointments first (chronological), then untimed due, then starts
+      const sortKey = x => x._kind==="start" ? "25:00" : (x.dueTime || "24:00");
+      Object.values(byDate).forEach(arr => arr.sort((a,b)=>sortKey(a).localeCompare(sortKey(b))));
 
       const y = cursor.getFullYear(), mo = cursor.getMonth();
       const startDow    = (new Date(y, mo, 1).getDay() + 6) % 7;   // Monday-first
@@ -1443,7 +1468,7 @@
                         <span style={{width:5,height:5,borderRadius:"50%",flexShrink:0,boxSizing:"border-box",
                                       background:isStart?"transparent":(od?"#ef4444":dot[i._list]||"#94a3b8"),
                                       border:isStart?"1.5px solid #1d4ed8":"none"}}/>
-                        <span style={{overflow:"hidden",textOverflow:"ellipsis"}}>{i._list==="next"?(i.title.replace(/^\[[^\]]+\]\s*/,"")):i.title}</span>
+                        <span style={{overflow:"hidden",textOverflow:"ellipsis"}}>{!isStart&&i.dueTime?<span style={{fontWeight:700}}>{i.dueTime} </span>:null}{i._list==="next"?(i.title.replace(/^\[[^\]]+\]\s*/,"")):i.title}</span>
                       </div>
                       );
                     })}
@@ -1486,9 +1511,16 @@
                           {i.context&&i.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{i.context}</Tag>}
                           {i.waitingFor&&<Tag bg="#fffbeb" c="#b45309">👤 {i.waitingFor}</Tag>}
                           {isStart&&<Tag bg="#eff6ff" c="#1d4ed8">🕒 starts</Tag>}
+                          {!isStart&&i.dueTime&&<Tag bg="#f0fdf4" c="#166534">⏰ {fmtTime(i.dueTime)}</Tag>}
                           {ov&&<Tag bg="#fef2f2" c="#b91c1c">⚠️ overdue</Tag>}
                         </div>
                       </div>
+                      {onEdit && i._list!=="reference" && (
+                        <button onClick={()=>onEdit(i._list,i)} title="Edit"
+                          style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:13,lineHeight:1,padding:"0 2px",flexShrink:0}}
+                          onMouseEnter={e=>e.currentTarget.style.color="#6366f1"}
+                          onMouseLeave={e=>e.currentTarget.style.color="#94a3b8"}>✎</button>
+                      )}
                       <button onClick={()=>onGoto(i._list)} title={"Open "+META[i._list].label}
                         style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:14,lineHeight:1,padding:"0 2px",flexShrink:0}}
                         onMouseEnter={e=>e.currentTarget.style.color="#6366f1"}
@@ -1705,13 +1737,14 @@
       const [title,      setTitle]      = useState(list==="next"||list==="waiting" ? item.title.replace(/^\[[^\]]+\]\s*/,"") : item.title);
       const [context,    setContext]    = useState(item.context||"@anywhere");
       const [dueDate,    setDueDate]    = useState(item.dueDate||"");
+      const [dueTime,    setDueTime]    = useState(item.dueTime||"");
       const [startDate,  setStartDate]  = useState(item.startDate||"");
       const [waitingFor, setWaitingFor] = useState(item.waitingFor||"");
       const can = title.trim();
       const showCtx  = list==="next";
       const showWait = list==="waiting";
       const showDue  = ["next","projects","waiting","someday"].includes(list);
-      const confirm = () => { if (can) onConfirm({ title:title.trim(), context, dueDate, startDate, waitingFor:waitingFor.trim(), pname }); };
+      const confirm = () => { if (can) onConfirm({ title:title.trim(), context, dueDate, dueTime:dueDate?dueTime:"", startDate, waitingFor:waitingFor.trim(), pname }); };
       const overlay = {position:"fixed",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200};
       const box     = {background:"#fff",borderRadius:14,padding:22,width:420,maxWidth:"92vw",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
       const lbl     = {fontSize:10,fontWeight:700,color:"#94a3b8",textTransform:"uppercase",letterSpacing:".8px",marginBottom:6};
@@ -1749,8 +1782,15 @@
                 <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)}
                   style={{...inp,marginBottom:14}}/>
                 <div style={lbl}>Due date</div>
-                <input type="date" value={dueDate} onChange={e=>setDueDate(e.target.value)}
-                  style={{...inp,marginBottom:14}}/>
+                <input type="date" value={dueDate} onChange={e=>{setDueDate(e.target.value); if(!e.target.value) setDueTime("");}}
+                  style={{...inp,marginBottom:dueDate?8:14}}/>
+                {dueDate&&(
+                  <React.Fragment>
+                    <div style={lbl}>Due time <span style={{textTransform:"none",fontWeight:400,color:"#cbd5e1"}}>· optional, for appointments</span></div>
+                    <input type="time" value={dueTime} onChange={e=>setDueTime(e.target.value)}
+                      style={{...inp,marginBottom:14}}/>
+                  </React.Fragment>
+                )}
               </React.Fragment>
             )}
             <div style={{display:"flex",gap:8}}>
@@ -1799,6 +1839,7 @@
       const [naTitle,   setNaTitle]   = useState("");
       const [naCtx,     setNaCtx]     = useState("@anywhere");
       const [naDue,     setNaDue]     = useState("");
+      const [naDueTime, setNaDueTime] = useState("");
       const [naStart,   setNaStart]   = useState("");
       const [waitTxt,   setWaitTxt]   = useState("");
       const [secsLeft,  setSecsLeft]  = useState(120);
@@ -1871,7 +1912,7 @@
 
       if (phase==="next") {
         const can = naTitle.trim();
-        const confirm = () => { if (can) onMove("next", {title:naTitle.trim(), context:naCtx, dueDate:naDue, startDate:naStart}); };
+        const confirm = () => { if (can) onMove("next", {title:naTitle.trim(), context:naCtx, dueDate:naDue, dueTime:naDue?naDueTime:"", startDate:naStart}); };
         return (
           <div style={overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
             <div style={box}>
@@ -1898,9 +1939,15 @@
                     style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
                 </label>
                 <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Due
-                  <input type="date" value={naDue} onChange={e=>setNaDue(e.target.value)}
+                  <input type="date" value={naDue} onChange={e=>{setNaDue(e.target.value); if(!e.target.value) setNaDueTime("");}}
                     style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
                 </label>
+                {naDue && (
+                  <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600,gridColumn:"1 / -1"}} title="Optional — set a time only for a real appointment">Due time (optional)
+                    <input type="time" value={naDueTime} onChange={e=>setNaDueTime(e.target.value)}
+                      style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+                  </label>
+                )}
               </div>
               <button onClick={confirm} disabled={!can}
                 style={{width:"100%",padding:"10px",background:can?"#6366f1":"#e2e8f0",color:can?"#fff":"#94a3b8",
@@ -1916,7 +1963,7 @@
         const canConfirm = firstType==="next" ? naTitle.trim() : waitTxt.trim();
         const confirm = () => {
           const first = firstType==="next"
-            ? {type:"next", title:naTitle.trim(), context:naCtx, dueDate:naDue, startDate:naStart}
+            ? {type:"next", title:naTitle.trim(), context:naCtx, dueDate:naDue, dueTime:naDue?naDueTime:"", startDate:naStart}
             : {type:"waiting", waitingFor:waitTxt.trim()};
           onMoveAsProject({dueDate:due}, first);
         };
@@ -1949,9 +1996,15 @@
                         style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
                     </label>
                     <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Due
-                      <input type="date" value={naDue} onChange={e=>setNaDue(e.target.value)}
+                      <input type="date" value={naDue} onChange={e=>{setNaDue(e.target.value); if(!e.target.value) setNaDueTime("");}}
                         style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
                     </label>
+                    {naDue && (
+                      <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600,gridColumn:"1 / -1"}} title="Optional — set a time only for a real appointment">Due time (optional)
+                        <input type="time" value={naDueTime} onChange={e=>setNaDueTime(e.target.value)}
+                          style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+                      </label>
+                    )}
                   </div>
                 </div>
               ) : (
@@ -1983,8 +2036,8 @@
                 ✅ Do it now — under 2 minutes
                 <div style={{fontSize:10,fontWeight:400,color:"#10b981",marginTop:2}}>Starts a 2-min timer — mark done when finished</div>
               </button>
-              <Opt bg="#f5f3ff" border="#c4b5fd" color="#5b21b6" onClick={()=>{setNaTitle(item.title);setNaCtx("@anywhere");setNaDue("");setNaStart("");setPhase("next");}}>⚡ Next Action — you do it</Opt>
-              <Opt bg="#f5f3ff" border="#ddd6fe" color="#4338ca" onClick={()=>{setNaTitle("");setNaCtx("@anywhere");setNaDue("");setNaStart("");setPhase("project");}}>📋 Project — multiple steps needed</Opt>
+              <Opt bg="#f5f3ff" border="#c4b5fd" color="#5b21b6" onClick={()=>{setNaTitle(item.title);setNaCtx("@anywhere");setNaDue("");setNaDueTime("");setNaStart("");setPhase("next");}}>⚡ Next Action — you do it</Opt>
+              <Opt bg="#f5f3ff" border="#ddd6fe" color="#4338ca" onClick={()=>{setNaTitle("");setNaCtx("@anywhere");setNaDue("");setNaDueTime("");setNaStart("");setPhase("project");}}>📋 Project — multiple steps needed</Opt>
               <input value={from} onChange={e=>setFrom(e.target.value)} placeholder="Waiting from whom?"
                 style={{padding:"7px 10px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,outline:"none"}}/>
               <input type="date" value={due} onChange={e=>setDue(e.target.value)}

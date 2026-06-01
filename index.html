@@ -113,7 +113,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v27";
+    const APP_VERSION = "v28";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     // GTD's other two "engage" criteria beyond context: energy available and time at hand.
@@ -121,9 +121,11 @@
     const ENERGIES = ["Low","Med","High"];
     const TIMES    = ["<15m","<1h",">1h"];
     const LISTS    = ["inbox","next","projects","waiting","someday","reference","done"];
-    // Sidebar order — same as LISTS plus the Calendar view (a cross-list view, not
-    // a stored list, so it stays out of LISTS to keep data/count logic untouched).
-    const NAV      = ["today","review","inbox","next","calendar","projects","waiting","someday","reference","done"];
+    // Sidebar order — GTD workflow order (capture→clarify→organize→reflect→engage):
+    // Inbox → the organize lists → Calendar/Weekly Review (reflect) → Done. Today leads
+    // as the daily home. `today`/`calendar`/`review` are cross-list views, not stored
+    // lists, so they stay out of LISTS to keep data/count logic untouched.
+    const NAV      = ["today","inbox","next","waiting","projects","someday","reference","calendar","review","done"];
     // Lists whose items can carry a dueDate and so appear on the Calendar.
     const DATED    = ["next","waiting","projects","someday"];
     // Lists the Today view draws from — actionable work only. Projects are outcomes
@@ -1694,7 +1696,7 @@
         : "You haven't run a Weekly Review yet";
 
       return (
-        <div style={{maxWidth:920,margin:"0 auto"}}>
+        <div style={{maxWidth:1180,margin:"0 auto"}}>
           <div style={{display:"flex",alignItems:"baseline",justifyContent:"space-between",flexWrap:"wrap",gap:6,marginBottom:4}}>
             <div style={{fontSize:15,fontWeight:700}}>🔄 Weekly Review</div>
             <div style={{fontSize:11,color:daysSinceReview>=7||daysSinceReview===null?"#b45309":"#64748b"}}>{lastTxt}</div>
@@ -1711,10 +1713,11 @@
             <div style={{fontSize:11,fontWeight:700,color:"#475569",minWidth:78,textAlign:"right"}}>{completed}/{allSteps.length} steps</div>
           </div>
 
-          {phases.map(ph=>(
-            <div key={ph.name} style={{marginBottom:16}}>
-              <div style={{fontSize:10,fontWeight:700,color:ph.color,textTransform:"uppercase",letterSpacing:".8px",marginBottom:7}}>{ph.name}</div>
-              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(330px,1fr))",gap:8,alignItems:"start"}}>
+          {/* three phases side by side — each a panel-column, steps stacked in sequence */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",gap:14,alignItems:"start",marginBottom:18}}>
+            {phases.map(ph=>(
+              <div key={ph.name} style={{border:"1px solid #e2e8f0",borderRadius:12,background:"#f8fafc",padding:14,display:"flex",flexDirection:"column",gap:8}}>
+                <div style={{fontSize:10,fontWeight:700,color:ph.color,textTransform:"uppercase",letterSpacing:".8px",borderBottom:`2px solid ${ph.color}22`,paddingBottom:7}}>{ph.name}</div>
                 {ph.steps.map(s=>{
                   const on = !!done[s.k];
                   return (
@@ -1733,17 +1736,17 @@
                             {s.note && <Tag bg={s.danger?"#fef2f2":"#f0fdf4"} c={s.danger?"#b91c1c":"#166534"}>{s.note}</Tag>}
                           </div>
                         )}
+                        {s.goto && (
+                          <button onClick={()=>onGoto(s.goto)} title={"Open "+(META[s.goto]?.label||s.goto)}
+                            className="btn btn-ghost btn-sm" style={{marginTop:7,whiteSpace:"nowrap"}}>Open →</button>
+                        )}
                       </div>
-                      {s.goto && (
-                        <button onClick={()=>onGoto(s.goto)} title={"Open "+(META[s.goto]?.label||s.goto)}
-                          className="btn btn-ghost btn-sm" style={{flexShrink:0,whiteSpace:"nowrap"}}>Open →</button>
-                      )}
                     </div>
                   );
                 })}
               </div>
-            </div>
-          ))}
+            ))}
+          </div>
 
           <button onClick={finish}
             style={{width:"100%",padding:"12px",background:pct===100?"#10b981":"#6366f1",color:"#fff",border:"none",borderRadius:9,cursor:"pointer",fontSize:13,fontWeight:700,marginTop:4}}>

@@ -64,7 +64,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v15";
+    const APP_VERSION = "v16";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     const LISTS    = ["inbox","next","projects","waiting","someday","reference","done"];
@@ -1714,7 +1714,6 @@
 
     // ── ProcessModal ──────────────────────────────────────────────
     function ProcessModal({ item, onMove, onMoveAsProject, onTrash, onClose }) {
-      const [ctx,       setCtx]       = useState("@anywhere");
       const [due,       setDue]       = useState("");
       const [from,      setFrom]      = useState("");
       const [phase,     setPhase]     = useState("main"); // "main" | "project" | "doit"
@@ -1791,6 +1790,43 @@
         );
       }
 
+      if (phase==="next") {
+        const can = naTitle.trim();
+        const confirm = () => { if (can) onMove("next", {title:naTitle.trim(), context:naCtx, dueDate:naDue}); };
+        return (
+          <div style={overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
+            <div style={box}>
+              <button onClick={()=>setPhase("main")}
+                style={{background:"none",border:"none",cursor:"pointer",color:"#6366f1",fontSize:12,marginBottom:12,padding:0}}>← Back</button>
+              <div style={{fontSize:14,fontWeight:700,marginBottom:3}}>Define the next action</div>
+              <div style={{fontSize:11,color:"#64748b",marginBottom:10}}>
+                GTD: the inbox note is just a reminder — name the concrete, physical action you'll actually do.
+              </div>
+              <div style={{background:"#f5f3ff",border:"1px solid #ddd6fe",borderRadius:8,padding:"8px 12px",marginBottom:14,fontSize:12,color:"#5b21b6"}}>
+                💭 <strong>{item.title}</strong>
+              </div>
+              <input autoFocus value={naTitle} onChange={e=>setNaTitle(e.target.value)}
+                onKeyDown={e=>e.key==="Enter"&&can&&confirm()}
+                placeholder="What is the very next physical action?"
+                style={{width:"100%",padding:"8px 10px",border:"1px solid #d1d5db",borderRadius:8,fontSize:13,outline:"none",marginBottom:8}}/>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7,marginBottom:14}}>
+                <select value={naCtx} onChange={e=>setNaCtx(e.target.value)}
+                  style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff"}}>
+                  {CONTEXTS.map(c=><option key={c}>{c}</option>)}
+                </select>
+                <input type="date" value={naDue} onChange={e=>setNaDue(e.target.value)}
+                  style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
+              </div>
+              <button onClick={confirm} disabled={!can}
+                style={{width:"100%",padding:"10px",background:can?"#6366f1":"#e2e8f0",color:can?"#fff":"#94a3b8",
+                  border:"none",borderRadius:8,cursor:can?"pointer":"default",fontSize:13,fontWeight:600}}>
+                ✓ Add to Next Actions
+              </button>
+            </div>
+          </div>
+        );
+      }
+
       if (phase==="project") {
         const canConfirm = firstType==="next" ? naTitle.trim() : waitTxt.trim();
         const confirm = () => {
@@ -1856,18 +1892,12 @@
                 ✅ Do it now — under 2 minutes
                 <div style={{fontSize:10,fontWeight:400,color:"#10b981",marginTop:2}}>Starts a 2-min timer — mark done when finished</div>
               </button>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7}}>
-                <select value={ctx} onChange={e=>setCtx(e.target.value)}
-                  style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff"}}>
-                  {CONTEXTS.map(c=><option key={c}>{c}</option>)}
-                </select>
-                <input type="date" value={due} onChange={e=>setDue(e.target.value)}
-                  style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
-              </div>
-              <Opt bg="#f5f3ff" border="#c4b5fd" color="#5b21b6" onClick={()=>onMove("next",{context:ctx,dueDate:due})}>⚡ Next Action — you do it</Opt>
-              <Opt bg="#f5f3ff" border="#ddd6fe" color="#4338ca" onClick={()=>setPhase("project")}>📋 Project — multiple steps needed</Opt>
+              <Opt bg="#f5f3ff" border="#c4b5fd" color="#5b21b6" onClick={()=>{setNaTitle(item.title);setNaCtx("@anywhere");setNaDue("");setPhase("next");}}>⚡ Next Action — you do it</Opt>
+              <Opt bg="#f5f3ff" border="#ddd6fe" color="#4338ca" onClick={()=>{setNaTitle("");setNaCtx("@anywhere");setNaDue("");setPhase("project");}}>📋 Project — multiple steps needed</Opt>
               <input value={from} onChange={e=>setFrom(e.target.value)} placeholder="Waiting from whom?"
                 style={{padding:"7px 10px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,outline:"none"}}/>
+              <input type="date" value={due} onChange={e=>setDue(e.target.value)}
+                style={{padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12}}/>
               <Opt bg="#fffbeb" border="#fde68a" color="#92400e" onClick={()=>onMove("waiting",{waitingFor:from,dueDate:due})}>⏳ Waiting For — someone else does it</Opt>
             </div>
 

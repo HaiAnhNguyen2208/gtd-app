@@ -113,7 +113,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v26";
+    const APP_VERSION = "v27";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     // GTD's other two "engage" criteria beyond context: energy available and time at hand.
@@ -1694,7 +1694,7 @@
         : "You haven't run a Weekly Review yet";
 
       return (
-        <div style={{maxWidth:640}}>
+        <div style={{maxWidth:920,margin:"0 auto"}}>
           <div style={{display:"flex",alignItems:"baseline",justifyContent:"space-between",flexWrap:"wrap",gap:6,marginBottom:4}}>
             <div style={{fontSize:15,fontWeight:700}}>🔄 Weekly Review</div>
             <div style={{fontSize:11,color:daysSinceReview>=7||daysSinceReview===null?"#b45309":"#64748b"}}>{lastTxt}</div>
@@ -1714,7 +1714,7 @@
           {phases.map(ph=>(
             <div key={ph.name} style={{marginBottom:16}}>
               <div style={{fontSize:10,fontWeight:700,color:ph.color,textTransform:"uppercase",letterSpacing:".8px",marginBottom:7}}>{ph.name}</div>
-              <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(330px,1fr))",gap:8,alignItems:"start"}}>
                 {ph.steps.map(s=>{
                   const on = !!done[s.k];
                   return (

@@ -113,7 +113,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v25";
+    const APP_VERSION = "v26";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     // GTD's other two "engage" criteria beyond context: energy available and time at hand.
@@ -1035,12 +1035,7 @@
         <div>
           <div style={{display:"flex",gap:5,marginBottom:12}}>
             {[["time","By date"],["project","By project"]].map(([g,lbl])=>(
-              <button key={g} onClick={()=>setGroupBy(g)}
-                style={{padding:"3px 10px",borderRadius:20,border:`1px solid ${groupBy===g?"#6366f1":"#e2e8f0"}`,
-                        background:groupBy===g?"#6366f1":"#fff",color:groupBy===g?"#fff":"#64748b",
-                        cursor:"pointer",fontSize:11,fontWeight:groupBy===g?600:400}}>
-                {lbl}
-              </button>
+              <button key={g} onClick={()=>setGroupBy(g)} className={"chip"+(groupBy===g?" on":"")}>{lbl}</button>
             ))}
           </div>
           {groups.map(g=>(
@@ -1101,10 +1096,7 @@
               <div style={{fontSize:11,color:"#64748b",marginTop:2}}>{actions.length} active action{actions.length!==1?"s":""}{proj.dueDate?` · 📅 ${proj.dueDate}`:""}</div>
             </div>
             {onEdit&&(
-              <button onClick={e=>{e.stopPropagation();onEdit();}} title="Edit"
-                style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:13,lineHeight:1,padding:"0 2px"}}
-                onMouseEnter={e=>e.target.style.color="#6366f1"}
-                onMouseLeave={e=>e.target.style.color="#94a3b8"}>✎</button>
+              <button onClick={e=>{e.stopPropagation();onEdit();}} title="Edit" className="ibtn" style={{fontSize:13}}>✎</button>
             )}
             <span style={{fontSize:11,color:"#94a3b8",transform:open?"rotate(180deg)":"none",transition:"transform .15s"}}>▼</span>
           </div>
@@ -2044,8 +2036,7 @@
             <div style={{background:"#f5f3ff",borderRadius:8,padding:"9px 12px",marginBottom:22,fontSize:11,color:"#6366f1",fontStyle:"italic"}}>
               GTD: process top to bottom, oldest first. Make a decision on each item — never put it back.
             </div>
-            <button onClick={onProcess}
-              style={{width:"100%",padding:"13px",background:"#6366f1",color:"#fff",border:"none",borderRadius:9,cursor:"pointer",fontSize:14,fontWeight:700}}>
+            <button onClick={onProcess} className="btn btn-pri" style={{width:"100%",padding:"13px",fontSize:14,borderRadius:9,fontWeight:700}}>
               Process this item →
             </button>
           </div>
@@ -2351,10 +2342,7 @@
               </button>
             </div>
 
-            <button onClick={onClose}
-              style={{marginTop:14,width:"100%",padding:"8px",background:"transparent",border:"1px solid #e2e8f0",borderRadius:8,cursor:"pointer",fontSize:12,color:"#64748b"}}>
-              Close
-            </button>
+            <button onClick={onClose} className="btn btn-ghost btn-sm" style={{marginTop:14,width:"100%"}}>Close</button>
           </div>
         </div>
       );

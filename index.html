@@ -64,13 +64,13 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v19";
+    const APP_VERSION = "v20";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     const LISTS    = ["inbox","next","projects","waiting","someday","reference","done"];
     // Sidebar order — same as LISTS plus the Calendar view (a cross-list view, not
     // a stored list, so it stays out of LISTS to keep data/count logic untouched).
-    const NAV      = ["today","inbox","next","calendar","projects","waiting","someday","reference","done"];
+    const NAV      = ["today","review","inbox","next","calendar","projects","waiting","someday","reference","done"];
     // Lists whose items can carry a dueDate and so appear on the Calendar.
     const DATED    = ["next","waiting","projects","someday"];
     // Lists the Today view draws from — actionable work only. Projects are outcomes
@@ -79,6 +79,7 @@
     const TODAY_LISTS = ["next","waiting"];
     const META = {
       today:     { icon:"🎯", label:"Today",          hint:"Your focus for today — plan and engage" },
+      review:    { icon:"🔄", label:"Weekly Review",   hint:"Reflect: get clear, get current, get creative" },
       inbox:     { icon:"📥", label:"Inbox",         hint:"Capture everything — process later" },
       next:      { icon:"⚡", label:"Next Actions",   hint:"Next physical, visible actions" },
       calendar:  { icon:"📅", label:"Calendar",       hint:"Scheduled items by due date" },
@@ -252,6 +253,7 @@
         (incoming[l] || []).forEach(i => map.set(i.id, i)); // incoming wins on id clash
         out[l] = Array.from(map.values());
       });
+      out._reviewedAt = Math.max(base._reviewedAt||0, incoming._reviewedAt||0);  // keep latest Weekly Review timestamp
       return out;
     };
 
@@ -488,7 +490,7 @@
           catch { alert("Could not read that file — is it a valid GTD backup (.json)?"); return; }
           if (!looksLikeState(parsed)) { alert("That doesn't look like a GTD backup file."); return; }
           const next = importMode.current === "replace"
-            ? { ...fresh(), ...pickLists(parsed) }
+            ? { ...fresh(), ...pickLists(parsed), _reviewedAt: parsed._reviewedAt||0 }
             : mergeStates(items, parsed);
           upd(next);
           setShowData(false);
@@ -619,6 +621,13 @@
       const projActions = {};
       (items.next||[]).forEach(a=>{ const p=exProj(a.title); if(p) (projActions[p]=projActions[p]||[]).push(a); });
 
+      // Weekly Review cadence (GTD's keystone Reflect habit). _reviewedAt is a synced
+      // state timestamp; "due" after 7 days or if never run.
+      const reviewedAt      = items._reviewedAt || 0;
+      const daysSinceReview = reviewedAt ? Math.floor((Date.now()-reviewedAt)/86400000) : null;
+      const reviewDue       = daysSinceReview===null || daysSinceReview>=7;
+      const markReviewed    = () => upd({ ...items, _reviewedAt: Date.now() });
+
       // cloud sync status (syncTick forces this to re-evaluate after each sync)
       void syncTick;
       const odReady   = Drive.available();
@@ -654,12 +663,15 @@
             <nav style={{flex:1,padding:"6px 8px"}}>
               {NAV.map(l => {
                 const m=META[l], on=active===l;
-                const badge = l==="done" ? todayDone : l==="calendar" ? plannedCount : l==="today" ? todayFocus.count : counts[l];
+                const reviewPill = l==="review" && reviewDue;
+                const badge = l==="done" ? todayDone : l==="calendar" ? plannedCount : l==="today" ? todayFocus.count : l==="review" ? 0 : counts[l];
                 return (
                   <button key={l} onClick={()=>{setActive(l);setCtx("all");setShowForm(false);setNavOpen(false);}}
                     style={{display:"flex",alignItems:"center",justifyContent:"space-between",width:"100%",padding:"8px 10px",background:on?"rgba(99,102,241,.18)":"transparent",border:"none",borderRadius:7,cursor:"pointer",color:on?"#a5b4fc":"#64748b",fontSize:12,fontWeight:on?600:400,textAlign:"left",marginBottom:1}}>
                     <span>{m.icon} {m.label}</span>
-                    {badge > 0 && (
+                    {reviewPill ? (
+                      <span style={{background:"#f59e0b",color:"#fff",fontSize:9,padding:"1px 6px",borderRadius:20,fontWeight:700}}>due</span>
+                    ) : badge > 0 && (
                       <span style={{background:l==="inbox"?"#ef4444":l==="done"?"#10b981":l==="calendar"?"#6366f1":l==="today"?(todayFocus.overdue?"#ef4444":"#6366f1"):"#1e293b",color:"#fff",fontSize:9,padding:"1px 6px",borderRadius:20,fontWeight:700}}>
                         {badge}
                       </span>
@@ -706,7 +718,7 @@
                     ↩ Undo
                   </button>
                 )}
-                {active!=="done" && active!=="calendar" && active!=="today" && (
+                {active!=="done" && active!=="calendar" && active!=="today" && active!=="review" && (
                   <button onClick={()=>setShowForm(s=>!s)}
                     style={{padding:"7px 14px",background:"#6366f1",color:"#fff",border:"none",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:600}}>
                     {showForm?"Cancel":"+ Add"}
@@ -780,6 +792,10 @@
                 <CalendarView items={items}
                   onComplete={(list,item)=>setComplCand({list,item})}
                   onEdit={(list,item)=>setEditCand({list,item})}
+                  onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}/>
+              ) : active==="review" ? (
+                <WeeklyReview items={items} todayISO={todayISO} reviewedAt={reviewedAt} daysSinceReview={daysSinceReview}
+                  onComplete={markReviewed}
                   onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}/>
               ) : active==="projects" ? (
                 shown.length===0
@@ -1530,6 +1546,117 @@
                 })}
               </div>
             )}
+          </div>
+        </div>
+      );
+    }
+
+    // ── WeeklyReview ──────────────────────────────────────────────
+    // GTD's keystone Reflect habit, as a guided checklist: get clear → get current →
+    // get creative. Surfaces live counts (inbox, stalled projects, stale waiting-for,
+    // overdue) so the review is actionable; completing it stamps _reviewedAt.
+    function WeeklyReview({ items, todayISO, reviewedAt, daysSinceReview, onComplete, onGoto }) {
+      const [done, setDone] = useState({});
+      const toggle = k => setDone(d => ({ ...d, [k]: !d[k] }));
+
+      const inbox = (items.inbox||[]).length;
+      const nextC = (items.next||[]).length;
+      const someC = (items.someday||[]).length;
+      const waiting = items.waiting||[];
+      const staleWait = waiting.filter(w => w.created && (Date.now()-new Date(w.created)) > 7*86400000).length;
+      const projects = items.projects||[];
+      const pa = {};
+      (items.next||[]).forEach(a=>{ const p=exProj(a.title); if(p)(pa[p]=pa[p]||[]).push(a); });
+      const stalled = projects.filter(p => !(pa[p.title]&&pa[p.title].length));
+      let overdue=0, upcoming=0;
+      DATED.forEach(l=>(items[l]||[]).forEach(i=>{ if(i.dueDate){ i.dueDate<todayISO ? overdue++ : upcoming++; }}));
+
+      const phases = [
+        { name:"1 · Get clear", color:"#0ea5e9", steps:[
+          {k:"collect", label:"Collect loose papers & materials", hint:"Round up stray notes, receipts, cards — drop them in your Inbox."},
+          {k:"inbox",   label:"Process your Inbox to zero", hint:"Decide what each item is and where it belongs — don't put anything back.", goto:"inbox", count:inbox, danger:inbox>0, note:inbox===0?"empty ✓":null},
+          {k:"mind",    label:"Empty your head", hint:"Capture any uncaptured commitments, ideas, or open loops."},
+        ]},
+        { name:"2 · Get current", color:"#6366f1", steps:[
+          {k:"next",    label:"Review Next Actions", hint:"Tick off completed ones; is each still the real next step?", goto:"next", count:nextC},
+          {k:"cal",     label:"Review Calendar — past & upcoming", hint:"Check last week for loose ends, the week ahead for commitments.", goto:"calendar", count:overdue+upcoming, danger:overdue>0, note:overdue>0?`${overdue} overdue`:null},
+          {k:"waiting", label:"Review Waiting For", hint:"Anyone to follow up on or nudge?", goto:"waiting", count:waiting.length, note:staleWait>0?`${staleWait} over a week old`:null},
+          {k:"projects",label:"Review Projects", hint:"Every active project needs a defined next action.", goto:"projects", count:projects.length, danger:stalled.length>0, note:stalled.length>0?`${stalled.length} stalled`:null},
+          {k:"someday", label:"Review Someday/Maybe", hint:"Anything ready to activate? Anything to let go?", goto:"someday", count:someC},
+        ]},
+        { name:"3 · Get creative", color:"#10b981", steps:[
+          {k:"creative", label:"Add new ideas & projects", hint:"What's possible now? Capture anything fresh that surfaced."},
+        ]},
+      ];
+      const allSteps  = phases.flatMap(p=>p.steps);
+      const completed = allSteps.filter(s=>done[s.k]).length;
+      const pct       = Math.round(completed/allSteps.length*100);
+      const finish    = () => { onComplete(); setDone({}); };
+
+      const lastTxt = reviewedAt
+        ? (daysSinceReview===0 ? "Last reviewed today 🎉" : `Last reviewed ${daysSinceReview} day${daysSinceReview===1?"":"s"} ago`)
+        : "You haven't run a Weekly Review yet";
+
+      return (
+        <div style={{maxWidth:640}}>
+          <div style={{display:"flex",alignItems:"baseline",justifyContent:"space-between",flexWrap:"wrap",gap:6,marginBottom:4}}>
+            <div style={{fontSize:15,fontWeight:700}}>🔄 Weekly Review</div>
+            <div style={{fontSize:11,color:daysSinceReview>=7||daysSinceReview===null?"#b45309":"#64748b"}}>{lastTxt}</div>
+          </div>
+          <div style={{fontSize:12,color:"#64748b",marginBottom:14}}>
+            The habit that keeps your system trustworthy. Walk each step, then mark it complete.
+          </div>
+
+          {/* progress */}
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:18}}>
+            <div style={{flex:1,height:8,background:"#e2e8f0",borderRadius:20,overflow:"hidden"}}>
+              <div style={{width:`${pct}%`,height:"100%",background:pct===100?"#10b981":"#6366f1",transition:"width .2s"}}/>
+            </div>
+            <div style={{fontSize:11,fontWeight:700,color:"#475569",minWidth:78,textAlign:"right"}}>{completed}/{allSteps.length} steps</div>
+          </div>
+
+          {phases.map(ph=>(
+            <div key={ph.name} style={{marginBottom:16}}>
+              <div style={{fontSize:10,fontWeight:700,color:ph.color,textTransform:"uppercase",letterSpacing:".8px",marginBottom:7}}>{ph.name}</div>
+              <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                {ph.steps.map(s=>{
+                  const on = !!done[s.k];
+                  return (
+                    <div key={s.k}
+                      style={{display:"flex",alignItems:"flex-start",gap:10,padding:"10px 12px",border:`1px solid ${on?"#86efac":"#e2e8f0"}`,borderRadius:9,background:on?"#f0fdf4":"#fff"}}>
+                      <button onClick={()=>toggle(s.k)} title={on?"Mark not done":"Mark done"}
+                        style={{width:18,height:18,borderRadius:"50%",border:`2px solid ${on?"#10b981":"#cbd5e1"}`,background:on?"#10b981":"#fff",color:"#fff",cursor:"pointer",flexShrink:0,marginTop:1,fontSize:11,lineHeight:1,padding:0}}>
+                        {on?"✓":""}
+                      </button>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:13,fontWeight:500,textDecoration:on?"line-through":"none",color:on?"#64748b":"#1e293b"}}>{s.label}</div>
+                        <div style={{fontSize:11,color:"#94a3b8",marginTop:2}}>{s.hint}</div>
+                        {(s.count!==undefined || s.note) && (
+                          <div style={{display:"flex",gap:5,marginTop:5,flexWrap:"wrap",alignItems:"center"}}>
+                            {s.count!==undefined && <Tag bg="#eef2ff" c="#4338ca">{s.count} item{s.count===1?"":"s"}</Tag>}
+                            {s.note && <Tag bg={s.danger?"#fef2f2":"#f0fdf4"} c={s.danger?"#b91c1c":"#166534"}>{s.note}</Tag>}
+                          </div>
+                        )}
+                      </div>
+                      {s.goto && (
+                        <button onClick={()=>onGoto(s.goto)} title={"Open "+(META[s.goto]?.label||s.goto)}
+                          style={{background:"none",border:"1px solid #e2e8f0",borderRadius:7,cursor:"pointer",color:"#475569",fontSize:11,fontWeight:600,padding:"4px 9px",flexShrink:0,whiteSpace:"nowrap"}}
+                          onMouseEnter={e=>e.currentTarget.style.borderColor="#6366f1"}
+                          onMouseLeave={e=>e.currentTarget.style.borderColor="#e2e8f0"}>Open →</button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+
+          <button onClick={finish}
+            style={{width:"100%",padding:"12px",background:pct===100?"#10b981":"#6366f1",color:"#fff",border:"none",borderRadius:9,cursor:"pointer",fontSize:13,fontWeight:700,marginTop:4}}>
+            {pct===100?"✓ Complete Weekly Review":"Mark Weekly Review complete"}
+          </button>
+          <div style={{fontSize:10,color:"#94a3b8",textAlign:"center",marginTop:8}}>
+            Completing resets the 7-day clock and clears the “due” reminder.
           </div>
         </div>
       );

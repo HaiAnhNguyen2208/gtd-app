@@ -113,7 +113,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v28";
+    const APP_VERSION = "v29";
 
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     // GTD's other two "engage" criteria beyond context: energy available and time at hand.
@@ -322,6 +322,8 @@
         out[l] = Array.from(map.values());
       });
       out._reviewedAt = Math.max(base._reviewedAt||0, incoming._reviewedAt||0);  // keep latest Weekly Review timestamp
+      const rd = incoming._reviewDay!=null ? incoming._reviewDay : base._reviewDay;  // chosen review weekday (incoming wins)
+      if (rd!=null) out._reviewDay = rd;
       return out;
     };
 
@@ -384,6 +386,9 @@
       const [showData, setShowData]       = useState(false);
       const [navOpen,  setNavOpen]        = useState(false);  // mobile drawer
       const [updateReady, setUpdateReady] = useState(false);  // new build deployed → offer reload
+      const [pipOn, setPipOn]             = useState(false);  // floating (always-on-top) Today window open
+      const pipWinRef  = React.useRef(null);                  // the Document-PiP window
+      const pipRootRef = React.useRef(null);                  // its own React root (separate document)
       const fileInputRef = React.useRef(null);
       const importMode   = React.useRef("merge");
       // OneDrive cloud sync (optional)
@@ -563,7 +568,7 @@
           catch { alert("Could not read that file — is it a valid GTD backup (.json)?"); return; }
           if (!looksLikeState(parsed)) { alert("That doesn't look like a GTD backup file."); return; }
           const next = importMode.current === "replace"
-            ? { ...fresh(), ...pickLists(parsed), _reviewedAt: parsed._reviewedAt||0 }
+            ? { ...fresh(), ...pickLists(parsed), _reviewedAt: parsed._reviewedAt||0, ...(parsed._reviewDay!=null?{_reviewDay:parsed._reviewDay}:{}) }
             : mergeStates(items, parsed);
           upd(next);
           setShowData(false);
@@ -659,6 +664,48 @@
         upd(n); setComplCand(null);
       };
 
+      // ── Floating Today (Document Picture-in-Picture) ──────────────
+      // Chromium-only: opens a real always-on-top OS window for a compact, live Today
+      // glance + Inbox quick-capture while working in other apps. It runs in its OWN
+      // React root (separate document — so React's event delegation actually fires
+      // there); App re-renders it via the effect below whenever `items` change.
+      const pipSupported = typeof window!=="undefined" && "documentPictureInPicture" in window;
+      const closePip = () => {
+        try { pipRootRef.current && pipRootRef.current.unmount(); } catch(e){}
+        pipRootRef.current = null;
+        const w = pipWinRef.current; pipWinRef.current = null;
+        try { w && w.close(); } catch(e){}
+        setPipOn(false);
+      };
+      const openPip = async () => {
+        if (!pipSupported || pipWinRef.current) return;
+        let w;
+        try { w = await window.documentPictureInPicture.requestWindow({ width:380, height:560 }); }
+        catch(e){ return; }   // user dismissed, or not allowed
+        // PiP windows inherit no styles — clone the app's <style>/<link> so the design
+        // system (.btn/.ibtn/.chip/.in, :root vars) is available inside the float.
+        document.querySelectorAll('style,link[rel="stylesheet"]').forEach(n=>w.document.head.appendChild(n.cloneNode(true)));
+        w.document.title = "GTD · Today";
+        Object.assign(w.document.body.style, { margin:"0", fontFamily:"'Inter',system-ui,sans-serif", background:"#f1f5f9", color:"#1e293b" });
+        w.addEventListener("pagehide", closePip);   // user closed the float window
+        pipWinRef.current  = w;
+        pipRootRef.current = ReactDOM.createRoot(w.document.body);
+        setPipOn(true);
+      };
+      // Keep the floating window live — re-render its root on every state change
+      // (handlers below close over the current `items`).
+      React.useEffect(() => {
+        if (!pipOn || !pipRootRef.current || !items) return;
+        const today = isoDate(new Date());
+        pipRootRef.current.render(
+          <FloatToday items={items} todayISO={today}
+            onComplete={(list,it)=>confirmComplete(list,it.id,"later",null)}
+            onToggleFocus={toggleFocus}
+            onCapture={t=>upd({ ...items, inbox:[mk(t), ...items.inbox] })}
+            onClose={closePip}/>
+        );
+      }, [pipOn, items]);
+
       if (!items) return (
         <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",color:"#64748b",fontSize:14}}>
           Loading…
@@ -697,11 +744,20 @@
       (items.next||[]).forEach(a=>{ const p=exProj(a.title); if(p) (projActions[p]=projActions[p]||[]).push(a); });
 
       // Weekly Review cadence (GTD's keystone Reflect habit). _reviewedAt is a synced
-      // state timestamp; "due" after 7 days or if never run.
+      // state timestamp; _reviewDay is the chosen review weekday (0=Sun … 6=Sat, default
+      // Saturday). It's only flagged "due" from that weekday onward each week (not a rolling
+      // 7-day timer) until done — so the nudge lands on your review day, then clears.
       const reviewedAt      = items._reviewedAt || 0;
+      const reviewDay       = items._reviewDay==null ? 6 : items._reviewDay;
       const daysSinceReview = reviewedAt ? Math.floor((Date.now()-reviewedAt)/86400000) : null;
-      const reviewDue       = daysSinceReview===null || daysSinceReview>=7;
+      const reviewWindowStart = (() => {
+        const d = new Date(); d.setHours(0,0,0,0);
+        d.setDate(d.getDate() - ((d.getDay()-reviewDay+7)%7));   // most recent reviewDay (today if it is one)
+        return d.getTime();
+      })();
+      const reviewDue       = reviewedAt < reviewWindowStart;     // not reviewed since this week's review day
       const markReviewed    = () => upd({ ...items, _reviewedAt: Date.now() });
+      const setReviewDay    = d => upd({ ...items, _reviewDay: d });
 
       // cloud sync status (syncTick forces this to re-evaluate after each sync)
       void syncTick;
@@ -789,6 +845,10 @@
               <div style={{display:"flex",gap:6,alignItems:"center"}}>
                 {history.length > 0 && (
                   <button onClick={undo} title="Undo (Ctrl+Z)" className="btn btn-ghost btn-sm">↩ Undo</button>
+                )}
+                {pipSupported && (
+                  <button onClick={pipOn?closePip:openPip} title={pipOn?"Close the floating window":"Pop out a floating, always-on-top Today window"}
+                    className={"btn btn-sm "+(pipOn?"btn-pri":"btn-ghost")}>⤢ {pipOn?"Floating":"Float"}</button>
                 )}
                 {active!=="done" && active!=="calendar" && active!=="today" && active!=="review" && (
                   <button onClick={()=>setShowForm(s=>!s)} className="btn btn-pri btn-sm">{showForm?"Cancel":"+ Add"}</button>
@@ -887,6 +947,7 @@
                   onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}/>
               ) : active==="review" ? (
                 <WeeklyReview items={items} todayISO={todayISO} reviewedAt={reviewedAt} daysSinceReview={daysSinceReview}
+                  reviewDay={reviewDay} onSetReviewDay={setReviewDay}
                   onComplete={markReviewed}
                   onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}/>
               ) : active==="projects" ? (
@@ -1493,6 +1554,105 @@
       );
     }
 
+    // ── FloatToday ────────────────────────────────────────────────
+    // Compact companion rendered into a Document Picture-in-Picture window (see
+    // App.openPip): an always-on-top floating panel to glance at today and capture
+    // into the Inbox while working in other apps. Self-contained — every mutation is
+    // passed in as a prop (it shares no React context with the main tree).
+    function FloatToday({ items, todayISO, onComplete, onToggleFocus, onCapture, onClose }) {
+      const [tab, setTab]   = useState("today");
+      const [text, setText] = useState("");
+      const fire = () => { const t=text.trim(); if(!t) return; onCapture(t); setText(""); };
+
+      // same Today classification as TodayView, flattened + ranked into one list
+      const seen=new Set(), rows=[];
+      TODAY_LISTS.forEach(l=>(items[l]||[]).forEach(i=>{
+        if (seen.has(i.id) || isDeferred(i,todayISO)) return;
+        const od=i.dueDate&&i.dueDate<todayISO, due=i.dueDate===todayISO,
+              foc=l==="next"&&i.focusDate===todayISO, start=i.startDate&&i.startDate<=todayISO&&!due&&!od;
+        if (od||due||foc||start){ seen.add(i.id); rows.push({...i,_list:l,_kind:od?"overdue":foc?"focus":due?"due":"started"}); }
+      }));
+      const rank={overdue:0,focus:1,due:2,started:3};
+      rows.sort((a,b)=>(rank[a._kind]-rank[b._kind])||((a.dueTime||"24:00").localeCompare(b.dueTime||"24:00")));
+      const inbox = items.inbox||[];
+      const kindMeta = { overdue:["⚠️","#b91c1c","#fff7f7","#fca5a5"], focus:["🎯","#7c3aed","#fff","#e2e8f0"],
+                         due:["📅","#166534","#fff","#e2e8f0"], started:["🚀","#1d4ed8","#fff","#e2e8f0"] };
+
+      return (
+        <div style={{display:"flex",flexDirection:"column",height:"100vh",fontFamily:"'Inter',system-ui,sans-serif"}}>
+          {/* header */}
+          <div style={{display:"flex",alignItems:"center",gap:8,padding:"10px 12px",background:"#1e293b",color:"#f1f5f9",flexShrink:0}}>
+            <div style={{fontSize:13,fontWeight:700,flex:1}}>🎯 Today</div>
+            <button onClick={onClose} title="Close floating window"
+              style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:17,lineHeight:1,padding:0}}>×</button>
+          </div>
+
+          {/* quick capture → Inbox */}
+          <div style={{display:"flex",gap:6,padding:"10px 12px",background:"#fff",borderBottom:"1px solid #e2e8f0",flexShrink:0}}>
+            <input autoFocus value={text} onChange={e=>setText(e.target.value)}
+              onKeyDown={e=>e.key==="Enter"&&fire()} placeholder="Capture a thought…"
+              className="in in-sm" style={{flex:1}}/>
+            <button onClick={fire} className="btn btn-pri btn-sm">+</button>
+          </div>
+
+          {/* tabs */}
+          <div style={{display:"flex",gap:6,padding:"8px 12px",background:"#fff",borderBottom:"1px solid #e2e8f0",flexShrink:0}}>
+            <button onClick={()=>setTab("today")} className={"chip"+(tab==="today"?" on":"")}>🎯 Today · {rows.length}</button>
+            <button onClick={()=>setTab("inbox")} className={"chip"+(tab==="inbox"?" on":"")}>📥 Inbox · {inbox.length}</button>
+          </div>
+
+          {/* body */}
+          <div style={{flex:1,overflowY:"auto",padding:"10px 12px",display:"flex",flexDirection:"column",gap:6}}>
+            {tab==="today" ? (
+              rows.length===0 ? (
+                <div style={{textAlign:"center",color:"#94a3b8",fontSize:12,padding:"28px 8px"}}>
+                  <div style={{fontSize:30,marginBottom:8}}>🎯</div>Nothing on deck.<br/>Star next actions in the app.
+                </div>
+              ) : rows.map(i=>{
+                const [ic,col,bg,bd]=kindMeta[i._kind];
+                const pname=exProj(i.title), title=i._list==="next"&&pname?i.title.replace(/^\[[^\]]+\]\s*/,""):i.title;
+                const foc=i._list==="next"&&i.focusDate===todayISO;
+                return (
+                  <div key={i.id} style={{display:"flex",alignItems:"flex-start",gap:9,padding:"8px 10px",border:`1px solid ${bd}`,borderRadius:9,background:bg}}>
+                    <button onClick={()=>onComplete(i._list,{...i})} title="Mark done"
+                      style={{width:17,height:17,borderRadius:"50%",border:"2px solid #cbd5e1",background:"#fff",cursor:"pointer",flexShrink:0,marginTop:1}}/>
+                    <div style={{flex:1,minWidth:0}}>
+                      {i._list==="next"&&pname&&<div style={{fontSize:9.5,color:"#7c3aed",fontWeight:600,marginBottom:1}}>📋 {pname}</div>}
+                      <div style={{fontSize:12.5,fontWeight:500,wordBreak:"break-word"}}>{title}</div>
+                      <div style={{fontSize:10,color:col,fontWeight:600,marginTop:2}}>
+                        {ic} {i._kind==="overdue"?"Overdue":i._kind==="focus"?"Focused":i._kind==="due"?"Due today":"Ready"}
+                        {i.dueDate&&` · ${dueLabel(i.dueDate,i.dueTime)}`}
+                      </div>
+                    </div>
+                    {i._list==="next"&&(
+                      <button onClick={()=>onToggleFocus(i.id)} title={foc?"Unfocus":"Focus for today"}
+                        style={{background:"none",border:"none",cursor:"pointer",color:foc?"#f59e0b":"#cbd5e1",fontSize:14,lineHeight:1,padding:0,flexShrink:0}}>{foc?"★":"☆"}</button>
+                    )}
+                  </div>
+                );
+              })
+            ) : (
+              inbox.length===0 ? (
+                <div style={{textAlign:"center",color:"#94a3b8",fontSize:12,padding:"28px 8px"}}>
+                  <div style={{fontSize:30,marginBottom:8}}>📥</div>Inbox zero.
+                </div>
+              ) : (
+                <React.Fragment>
+                  <div style={{fontSize:10,color:"#94a3b8"}}>Captured — process in the main window.</div>
+                  {inbox.map(i=>(
+                    <div key={i.id} style={{display:"flex",gap:8,padding:"8px 10px",border:"1px solid #e2e8f0",borderRadius:9,background:"#fff",fontSize:12.5}}>
+                      <span style={{color:"#cbd5e1",flexShrink:0}}>•</span>
+                      <span style={{wordBreak:"break-word"}}>{i.title}</span>
+                    </div>
+                  ))}
+                </React.Fragment>
+              )
+            )}
+          </div>
+        </div>
+      );
+    }
+
     // ── CalendarView ──────────────────────────────────────────────
     // A cross-list month grid of every dated item (next/waiting/projects/someday).
     // Read-mostly: click a day to inspect its items; complete or jump to the source
@@ -1653,9 +1813,10 @@
     // GTD's keystone Reflect habit, as a guided checklist: get clear → get current →
     // get creative. Surfaces live counts (inbox, stalled projects, stale waiting-for,
     // overdue) so the review is actionable; completing it stamps _reviewedAt.
-    function WeeklyReview({ items, todayISO, reviewedAt, daysSinceReview, onComplete, onGoto }) {
+    function WeeklyReview({ items, todayISO, reviewedAt, daysSinceReview, reviewDay, onSetReviewDay, onComplete, onGoto }) {
       const [done, setDone] = useState({});
       const toggle = k => setDone(d => ({ ...d, [k]: !d[k] }));
+      const WD = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
 
       const inbox = (items.inbox||[]).length;
       const nextC = (items.next||[]).length;
@@ -1701,8 +1862,19 @@
             <div style={{fontSize:15,fontWeight:700}}>🔄 Weekly Review</div>
             <div style={{fontSize:11,color:daysSinceReview>=7||daysSinceReview===null?"#b45309":"#64748b"}}>{lastTxt}</div>
           </div>
-          <div style={{fontSize:12,color:"#64748b",marginBottom:14}}>
-            The habit that keeps your system trustworthy. Walk each step, then mark it complete.
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginBottom:14}}>
+            <div style={{fontSize:12,color:"#64748b"}}>
+              The habit that keeps your system trustworthy. Walk each step, then mark it complete.
+            </div>
+            {onSetReviewDay && (
+              <label style={{display:"flex",alignItems:"center",gap:6,fontSize:11,color:"#64748b",whiteSpace:"nowrap"}}>
+                Review day
+                <select className="in in-sm" value={reviewDay} onChange={e=>onSetReviewDay(Number(e.target.value))}
+                  title="The reminder appears from this day each week until you complete the review">
+                  {WD.map((d,i)=><option key={i} value={i}>{d}</option>)}
+                </select>
+              </label>
+            )}
           </div>
 
           {/* progress */}

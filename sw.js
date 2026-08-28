@@ -5,7 +5,7 @@
  * never intercepted — they hit the network when a server is reachable and are
  * simply allowed to fail offline (the app falls back to localStorage). */
 
-const CACHE = "gtd-v29";
+const CACHE = "gtd-v30";
 
 const SHELL = [
   "./",
@@ -42,7 +42,7 @@ self.addEventListener("fetch", (e) => {
   if (req.method !== "GET") return;                       // POST /api/state etc. → straight to network
 
   const url = new URL(req.url);
-  if (url.pathname.endsWith("/api/state") || url.pathname.endsWith("/api/ping")) return;
+  if (url.pathname.endsWith("/api/state") || url.pathname.endsWith("/api/archive") || url.pathname.endsWith("/api/ping")) return;
   // OneDrive auth + data must always hit the network — never cache or intercept.
   if (url.hostname === "graph.microsoft.com" || url.hostname === "login.microsoftonline.com") return;
 

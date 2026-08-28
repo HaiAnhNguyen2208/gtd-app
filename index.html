@@ -113,8 +113,10 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v29";
+    const APP_VERSION = "v30";
 
+    // Default contexts — seed only. Since schema v2 the live list is state.contexts,
+    // editable in-app (Sync & Backup → Contexts); this constant is the fallback/seed.
     const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
     // GTD's other two "engage" criteria beyond context: energy available and time at hand.
     // Optional on a Next Action; "" = unset. Stored as these literal labels.
@@ -147,7 +149,7 @@
 
     // ── Helpers ───────────────────────────────────────────────────
     const ts      = () => new Date().toISOString();
-    const mk      = t  => ({ id: Date.now()+Math.random(), title:t.trim(), created:ts(), context:"@anywhere", dueDate:"", dueTime:"", startDate:"", waitingFor:"", energy:"", time:"" });
+    const mk      = t  => ({ id: Date.now()+Math.random(), title:t.trim(), created:ts(), projectId:"", context:"@anywhere", dueDate:"", dueTime:"", startDate:"", waitingFor:"", energy:"", time:"", _updatedAt: Date.now() });
     const exProj  = t  => { const m=(t||"").match(/^\[([^\]]+)\]/); return m?m[1]:null; };
     const fmtDate = d  => { try{ return new Date(d).toLocaleDateString("vi-VN",{day:"2-digit",month:"2-digit",year:"numeric"}); }catch{return d||"";} };
     // "HH:MM" (24h) → "h:mm AM/PM"; blank stays blank. Optional time turns a due DATE into a
@@ -160,7 +162,8 @@
     // GTD tickler: an item with a future start date is "deferred" — hidden from the active
     // Next Actions / Waiting / Today lists until its start day, then it resurfaces.
     const isDeferred = (i, today) => i.startDate && i.startDate > today;
-    const fresh   = () => ({ inbox:[], next:[], projects:[], waiting:[], someday:[], reference:[], done:[] });
+    const fresh   = () => ({ schemaVersion:SCHEMA_VERSION, inbox:[], next:[], projects:[], waiting:[], someday:[], reference:[], done:[],
+                             contexts:[...CONTEXTS], tombstones:{}, _reviewedAt:0, _metaUpdatedAt:0, _updatedAt:0 });
     // PWA share target: when the user shares text/a link from another app (Android/Win),
     // the OS launches us at start_url with ?title/&text/&url. Read it once into a capture
     // string and strip the query so a reload can't re-add it. Returns "" when not a share.
@@ -174,43 +177,194 @@
         return parts.join(" — ");
       } catch { return ""; }
     };
-    // Pick the candidate with the newest _updatedAt (strict — ties keep the earlier one,
-    // so local wins ties and remotes are adopted only when genuinely newer).
-    const pickNewest = cands => {
-      const valid = cands.filter(c => c && c.data);
-      if (!valid.length) return null;
-      return valid.reduce((best, c) => ((c.data._updatedAt||0) > (best.data._updatedAt||0) ? c : best));
+    // ═══ DATA CORE (schema v2) ═══════════════════════════════════
+    // Pure data functions — no DOM, no network. tests/test_data_core.js extracts
+    // everything from `const CONTEXTS` down to END DATA CORE and runs it in Node;
+    // keep this block free of JSX and browser APIs.
+    //
+    // Schema v2: every item carries its own `_updatedAt` (ms) and an explicit
+    // `projectId` link (no more [Project] title prefixes in stored data);
+    // the state carries `contexts` (user-editable), `tombstones` {id: deletedAt}
+    // so deletions survive merging, and `_metaUpdatedAt` for non-item settings.
+    const SCHEMA_VERSION = 2;
+    const ARCHIVE_DAYS   = 90;   // done items older than this rotate into the archive store
+    const TOMB_DAYS      = 60;   // tombstones are pruned after this (all devices have synced)
+
+    const pickLists      = src => Object.fromEntries(LISTS.map(l => [l, Array.isArray(src[l]) ? src[l] : []]));
+    const looksLikeState = d   => d && typeof d === "object" && LISTS.some(l => Array.isArray(d[l]));
+    const sameState      = (x, y) => JSON.stringify(x) === JSON.stringify(y);
+    const stripPrefix    = t   => (t||"").replace(/^\[[^\]]+\]\s*/, "").trim();
+
+    // id → title for everything that can BE a project (active, deferred, or closed).
+    const projIndex = s => {
+      const m = new Map();
+      ["projects","someday","done"].forEach(l => (s[l]||[]).forEach(p => { if (!m.has(p.id)) m.set(p.id, p.title); }));
+      return m;
     };
+
+    // Capture convenience: typing "[Project] action" links the action to an EXISTING
+    // project by name (active or someday). No match ⇒ the title stays as typed.
+    const linkByPrefix = (title, s) => {
+      const p = exProj(title);
+      if (p) {
+        const key = p.trim().toLowerCase();
+        const hit = ["projects","someday"].flatMap(l => s[l]||[]).find(x => (x.title||"").trim().toLowerCase() === key);
+        if (hit) return { title: stripPrefix(title), projectId: hit.id };
+      }
+      return { title: (title||"").trim(), projectId: "" };
+    };
+
+    // Upgrade any stored/imported/remote state to schema v2. v1 → v2 stamps every
+    // item with the old state-level clock and converts [Project] title prefixes to
+    // projectId links (matched case-insensitively against projects/someday/done).
+    const migrate = raw => {
+      if (!looksLikeState(raw)) return null;
+      const s = { ...fresh(), ...pickLists(raw) };
+      s._reviewedAt = raw._reviewedAt || 0;
+      if (raw._reviewDay != null) s._reviewDay = raw._reviewDay;
+      s._updatedAt     = raw._updatedAt || 0;
+      s.contexts       = Array.isArray(raw.contexts) && raw.contexts.length ? [...raw.contexts] : [...CONTEXTS];
+      s.tombstones     = raw.tombstones && typeof raw.tombstones === "object" ? { ...raw.tombstones } : {};
+      s._metaUpdatedAt = raw._metaUpdatedAt || 0;
+      if ((raw.schemaVersion || 1) < 2) {
+        const stamp  = raw._updatedAt || Date.now();
+        const byName = new Map();
+        ["projects","someday","done"].forEach(l => (s[l]||[]).forEach(p => {
+          const k = (p.title||"").trim().toLowerCase();
+          if (k && !byName.has(k)) byName.set(k, p.id);
+        }));
+        LISTS.forEach(l => { s[l] = (s[l]||[]).map(i => {
+          const out = { ...i };
+          if (out._updatedAt == null) out._updatedAt = stamp;
+          if (out.projectId === undefined) {
+            const p  = exProj(out.title);
+            const id = p ? byName.get(p.trim().toLowerCase()) : undefined;
+            if (id !== undefined && id !== out.id) { out.projectId = id; out.title = stripPrefix(out.title) || out.title; }
+            else out.projectId = "";
+          }
+          return out;
+        }); });
+        if (!raw._metaUpdatedAt) s._metaUpdatedAt = stamp;
+      }
+      s.schemaVersion = SCHEMA_VERSION;
+      return s;
+    };
+
+    // Stamp `_updatedAt` on every item that changed vs `prev` (same-reference items
+    // skip instantly, deep-equal copies skip too), bump `_metaUpdatedAt` when the
+    // settings (contexts / review day) changed, and advance the state clock.
+    // Mutations build plain next-states; `upd` runs them through here — no call
+    // site has to remember to stamp anything.
+    const stampChanges = (prev, next) => {
+      const t   = Date.now();
+      const out = { ...next };
+      LISTS.forEach(l => {
+        const pm = new Map(((prev && prev[l]) || []).map(i => [i.id, i]));
+        out[l] = (next[l] || []).map(i => {
+          const p = pm.get(i.id);
+          if (p === i) return i;
+          if (p && JSON.stringify(p) === JSON.stringify(i)) return i;
+          return { ...i, _updatedAt: t };
+        });
+      });
+      if (prev && (JSON.stringify(prev.contexts) !== JSON.stringify(next.contexts) || prev._reviewDay !== next._reviewDay))
+        out._metaUpdatedAt = t;
+      out._updatedAt = t;
+      return out;
+    };
+
+    // Item-level merge — the heart of multi-device sync. Union across ALL lists
+    // keyed by item id; on a clash the copy with the newer `_updatedAt` wins whole
+    // (fields AND which list it lives in, so moves propagate). Ties keep `a` —
+    // call with local first. A tombstone kills any copy older than the deletion,
+    // so deletes propagate instead of resurrecting. Two devices editing DIFFERENT
+    // items concurrently now both keep their changes (v1 whole-state LWW lost one).
+    const mergeStates = (a, b) => {
+      const A = migrate(a) || fresh(), B = migrate(b) || fresh();
+      const index = s => { const m = new Map(); LISTS.forEach(l => (s[l]||[]).forEach(i => { if (!m.has(i.id)) m.set(i.id, { i, l }); })); return m; };
+      const ia = index(A), ib = index(B);
+      const tombs = { ...A.tombstones };
+      Object.entries(B.tombstones).forEach(([id, t]) => { if (!(tombs[id] >= t)) tombs[id] = t; });
+      const out = fresh();
+      const seen = new Set();
+      const choose = id => {
+        const ea = ia.get(id), eb = ib.get(id);
+        const e  = !eb ? ea : !ea ? eb : ((eb.i._updatedAt||0) > (ea.i._updatedAt||0) ? eb : ea);
+        if (!(tombs[id] > (e.i._updatedAt||0))) out[e.l].push(e.i);
+      };
+      LISTS.forEach(l => (A[l]||[]).forEach(i => { if (!seen.has(i.id)) { seen.add(i.id); choose(i.id); } }));
+      LISTS.forEach(l => (B[l]||[]).forEach(i => { if (!seen.has(i.id)) { seen.add(i.id); choose(i.id); } }));
+      const cutoff = Date.now() - TOMB_DAYS*86400000;
+      out.tombstones = Object.fromEntries(Object.entries(tombs).filter(([,t]) => t >= cutoff));
+      const meta = (B._metaUpdatedAt||0) > (A._metaUpdatedAt||0) ? B : A;
+      out.contexts = Array.isArray(meta.contexts) && meta.contexts.length ? [...meta.contexts] : [...CONTEXTS];
+      if (meta._reviewDay != null) out._reviewDay = meta._reviewDay;
+      out._metaUpdatedAt = Math.max(A._metaUpdatedAt||0, B._metaUpdatedAt||0);
+      out._reviewedAt    = Math.max(A._reviewedAt||0,    B._reviewedAt||0);
+      out._updatedAt     = Math.max(A._updatedAt||0,     B._updatedAt||0);
+      return out;
+    };
+
+    // Archive store (separate from live state so day-to-day sync stays small):
+    // append-only union by id, newest first.
+    const mergeArchive = (a, b) => {
+      const m = new Map();
+      [...(Array.isArray(a)?a:[]), ...(Array.isArray(b)?b:[])].forEach(i => { if (i && !m.has(i.id)) m.set(i.id, i); });
+      return Array.from(m.values()).sort((x, y) => String(y.doneAt||y.created||"").localeCompare(String(x.doneAt||x.created||"")));
+    };
+
+    // Rotate done items older than ARCHIVE_DAYS into the archive. They're
+    // tombstoned in the live state so other devices retire their copies through
+    // the normal merge instead of resurrecting them. Returns null when nothing
+    // needs to move.
+    const splitArchive = (state, archive) => {
+      const cut = new Date(Date.now() - ARCHIVE_DAYS*86400000).toISOString();
+      const stay = [], go = [];
+      (state.done||[]).forEach(i => ((i.doneAt||i.created||"") < cut ? go : stay).push(i));
+      if (!go.length) return null;
+      const t = Date.now();
+      const tombs = { ...state.tombstones };
+      go.forEach(i => { tombs[i.id] = t; });
+      return { state: { ...state, done: stay, tombstones: tombs, _updatedAt: t },
+               archive: mergeArchive(archive, go) };
+    };
+    // ═══ END DATA CORE ═══════════════════════════════════════════
 
     // ── Storage: offline-first ────────────────────────────────────
     // localStorage is the source of truth on every device (instant, works with
     // no server). The Flask /api/state endpoint is an OPTIONAL sync hub used
     // only when reachable (same PC / LAN / Tailscale). Reconciliation is
     // last-write-wins on a state-level `_updatedAt` timestamp.
-    const LS_KEY    = "gtd_state_v1";
-    const withStamp = d => ({ ...d, _updatedAt: Date.now() });
+    const LS_KEY  = "gtd_state_v1";     // key name is historical; content is migrated to schema v2 on read
+    const LS_ARCH = "gtd_archive_v1";
     const Store = {
       loadLocal() {
-        try { const s = localStorage.getItem(LS_KEY); return s ? JSON.parse(s) : null; }
+        try { const s = localStorage.getItem(LS_KEY); return s ? migrate(JSON.parse(s)) : null; }
         catch { return null; }
       },
       saveLocal(d) {
         try { localStorage.setItem(LS_KEY, JSON.stringify(d)); } catch {}
       },
-      async fetchServer(timeout=2000) {
+      loadArchive() {
+        try { const s = localStorage.getItem(LS_ARCH); const a = s ? JSON.parse(s) : []; return Array.isArray(a) ? a : []; }
+        catch { return []; }
+      },
+      saveArchive(a) {
+        try { localStorage.setItem(LS_ARCH, JSON.stringify(a)); } catch {}
+      },
+      async _get(url, timeout=2000) {
         try {
           const ctrl = new AbortController();
           const t = setTimeout(() => ctrl.abort(), timeout);
-          const r = await fetch("api/state", { signal: ctrl.signal });
+          const r = await fetch(url, { signal: ctrl.signal });
           clearTimeout(t);
           if (!r.ok) return null;
-          const d = await r.json();
-          return (d && Object.keys(d).length) ? d : null;
+          return await r.json();
         } catch { return null; }
       },
-      pushServer(d) {
+      _post(url, d) {
         try {
-          fetch("api/state", {
+          fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(d),
@@ -218,6 +372,16 @@
           }).catch(() => {});
         } catch {}
       },
+      async fetchServer(timeout=2000) {
+        const d = await this._get("api/state", timeout);
+        return (d && Object.keys(d).length) ? migrate(d) : null;
+      },
+      pushServer(d) { this._post("api/state", d); },
+      async fetchServerArchive(timeout=2000) {
+        const d = await this._get("api/archive", timeout);
+        return Array.isArray(d) ? d : null;
+      },
+      pushServerArchive(a) { this._post("api/archive", a); },
     };
     // ── OneDrive (Microsoft Graph) — optional cloud remote ───────
     // Lets every device (incl. the phone) sync the same gtd_state.json straight
@@ -230,10 +394,12 @@
     const MS_SCOPES    = ["Files.ReadWrite.AppFolder"];                  // only the app's own folder
     const OD_FLAG      = "gtd_onedrive_enabled";
     const GRAPH_ITEM   = "https://graph.microsoft.com/v1.0/me/drive/special/approot:/gtd_state.json";
+    const GRAPH_ARCH   = "https://graph.microsoft.com/v1.0/me/drive/special/approot:/gtd_archive.json";
 
     const Drive = {
       _msal: null,
-      _etag: null,
+      _etag: null,       // gtd_state.json
+      _archEtag: null,   // gtd_archive.json
       available() { return !!MS_CLIENT_ID && typeof msal !== "undefined"; },
       enabled()   { try { return localStorage.getItem(OD_FLAG) === "1"; } catch { return false; } },
       init() {
@@ -268,65 +434,76 @@
         catch { return (await m.acquireTokenPopup ({ scopes: MS_SCOPES, account: acct })).accessToken; }
       },
       // → { data, etag }; data null when the file doesn't exist yet. null on any failure.
-      async pull() {
+      async _pullFile(url, etagKey) {
         if (!this.available() || !this.enabled() || !this.account()) return null;
         try {
           const tok  = await this._token();
           const auth = { Authorization: "Bearer " + tok };
-          const meta = await fetch(GRAPH_ITEM, { headers: auth });
-          if (meta.status === 404) { this._etag = null; return { data: null, etag: null }; }
+          const meta = await fetch(url, { headers: auth });
+          if (meta.status === 404) { this[etagKey] = null; return { data: null, etag: null }; }
           if (!meta.ok) return null;
           const item = await meta.json();
-          this._etag = item.eTag || null;
-          const body = await fetch(GRAPH_ITEM + ":/content", { headers: auth });
+          this[etagKey] = item.eTag || null;
+          const body = await fetch(url + ":/content", { headers: auth });
           if (!body.ok) return null;
           const data = await body.json();
-          return { data: (data && Object.keys(data).length) ? data : null, etag: this._etag };
+          return { data, etag: this[etagKey] };
         } catch { return null; }
       },
-      // Best-effort conflict-safe write (If-Match on eTag). → true on success.
+      async _putFile(url, etagKey, d) {
+        const tok = await this._token();
+        const headers = { Authorization: "Bearer " + tok, "Content-Type": "application/json" };
+        if (this[etagKey]) headers["If-Match"] = this[etagKey];
+        const r = await fetch(url + ":/content", { method: "PUT", headers, body: JSON.stringify(d) });
+        if (r.ok) { const item = await r.json(); this[etagKey] = item.eTag || this[etagKey]; }
+        return r;
+      },
+      async pull() {
+        const res = await this._pullFile(GRAPH_ITEM, "_etag");
+        if (!res) return null;
+        return { data: migrate(res.data), etag: res.etag };
+      },
+      async pullArchive() {
+        const res = await this._pullFile(GRAPH_ARCH, "_archEtag");
+        if (!res) return null;
+        return { data: Array.isArray(res.data) ? res.data : null, etag: res.etag };
+      },
+      // Conflict-safe write (If-Match on eTag). On 412 (someone wrote first) the
+      // remote is pulled, MERGED item-by-item with ours, and the merge is written
+      // back — nobody's edits are lost. → { ok, merged? }: `merged` is set when a
+      // conflict merge produced a state the caller should adopt locally.
       async push(d, retry = true) {
-        if (!this.available() || !this.enabled() || !this.account()) return false;
+        if (!this.available() || !this.enabled() || !this.account()) return { ok: false };
         try {
-          const tok = await this._token();
-          const headers = { Authorization: "Bearer " + tok, "Content-Type": "application/json" };
-          if (this._etag) headers["If-Match"] = this._etag;
-          const r = await fetch(GRAPH_ITEM + ":/content", { method:"PUT", headers, body: JSON.stringify(d) });
-          if (r.status === 412 && retry) {                 // someone else wrote first
+          const r = await this._putFile(GRAPH_ITEM, "_etag", d);
+          if (r.status === 412 && retry) {
             const remote = await this.pull();              // refreshes this._etag
-            if (remote && remote.data && (remote.data._updatedAt || 0) > (d._updatedAt || 0)) return false; // remote newer — let poll adopt
-            return this.push(d, false);                    // we're newer — overwrite with fresh etag
+            const merged = remote && remote.data ? mergeStates(d, remote.data) : d;
+            const res    = await this.push(merged, false);
+            return res.ok ? { ok: true, merged } : { ok: false };
           }
-          if (!r.ok) return false;
-          const item = await r.json();
-          this._etag = item.eTag || this._etag;
-          return true;
-        } catch { return false; }
+          return { ok: r.ok };
+        } catch { return { ok: false }; }
+      },
+      async pushArchive(a, retry = true) {
+        if (!this.available() || !this.enabled() || !this.account()) return { ok: false };
+        try {
+          const r = await this._putFile(GRAPH_ARCH, "_archEtag", a);
+          if (r.status === 412 && retry) {
+            const remote = await this.pullArchive();       // refreshes this._archEtag
+            const merged = mergeArchive(a, remote && remote.data);
+            const res    = await this.pushArchive(merged, false);
+            return res.ok ? { ok: true, merged } : { ok: false };
+          }
+          return { ok: r.ok };
+        } catch { return { ok: false }; }
       },
     };
 
     // ── Data portability: export / import a JSON backup ──────────
     // Offline, server-free way to move data between devices and to back it up.
-    // Export → a downloadable (or shareable, on mobile) gtd-backup-*.json file.
-    // Import → MERGE (union by item id) or REPLACE the device's data.
-    const pickLists = src => Object.fromEntries(LISTS.map(l => [l, Array.isArray(src[l]) ? src[l] : []]));
-
-    const looksLikeState = d => d && typeof d === "object" && LISTS.some(l => Array.isArray(d[l]));
-
-    const mergeStates = (base, incoming) => {
-      const out = fresh();
-      LISTS.forEach(l => {
-        const map = new Map();
-        (base[l] || []).forEach(i => map.set(i.id, i));
-        (incoming[l] || []).forEach(i => map.set(i.id, i)); // incoming wins on id clash
-        out[l] = Array.from(map.values());
-      });
-      out._reviewedAt = Math.max(base._reviewedAt||0, incoming._reviewedAt||0);  // keep latest Weekly Review timestamp
-      const rd = incoming._reviewDay!=null ? incoming._reviewDay : base._reviewDay;  // chosen review weekday (incoming wins)
-      if (rd!=null) out._reviewDay = rd;
-      return out;
-    };
-
+    // Export → a downloadable (or shareable, on mobile) gtd-backup-*.json file
+    // holding the live state PLUS the archive. Import → MERGE or REPLACE.
     const exportData = data => {
       const payload = JSON.stringify(data, null, 2);
       const fname   = `gtd-backup-${new Date().toISOString().slice(0,10)}.json`;
@@ -344,7 +521,7 @@
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     };
 
-    const placeFor = l => ({ inbox:"Capture…", next:"[Project] Next action…", projects:"Project outcome…", waiting:"Waiting for…", someday:"Someday idea…", reference:"Reference title…" }[l]||"Add item…");
+    const placeFor = l => ({ inbox:"Capture…", next:"Next action…  (type [Project] to link one)", projects:"Project outcome…", waiting:"Waiting for…", someday:"Someday idea…", reference:"Reference title…" }[l]||"Add item…");
 
     const doneByTime = items => {
       const now   = new Date();
@@ -362,9 +539,9 @@
         .filter(b => b.items.length > 0);
     };
 
-    const doneByProject = items => {
+    const doneByProject = (items, pnameOf) => {
       const map = {};
-      items.forEach(i => { const p=exProj(i.title)||"Standalone"; (map[p]=map[p]||[]).push(i); });
+      items.forEach(i => { const p=pnameOf(i)||"Standalone"; (map[p]=map[p]||[]).push(i); });
       return Object.entries(map).map(([label,items]) => ({ label, items, defaultOpen:true }));
     };
 
@@ -395,9 +572,12 @@
       const [odAccount, setOdAccount]     = useState(() => Drive.account());
       const [syncing,   setSyncing]       = useState(false);
       const [syncTick,  setSyncTick]      = useState(0);   // bump to re-render the "last synced" label
+      const [archive, setArchiveState] = useState([]);   // rotated-out old Done items (separate store)
       const itemsRef    = React.useRef(null);
+      const archiveRef  = React.useRef([]);
       const lastSyncRef = React.useRef(0);
       const driveTimer  = React.useRef(null);
+      const setArchive  = a => { archiveRef.current = a; setArchiveState(a); Store.saveArchive(a); };
 
       // ── heartbeat — when served by Flask on the PC, lets the server exit
       //    once the browser closes. Harmless (and silently ignored) offline. ──
@@ -431,59 +611,92 @@
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, []);   // mount-only; syncNow is stable (useCallback) and only read inside .then after mount
 
-      // ── offline-first load: show local immediately, then reconcile with the
-      //    optional remotes (Flask hub + OneDrive) by last-write-wins on
-      //    _updatedAt. localStorage stays the source of truth on each device. ──
-      useEffect(() => {
-        const base      = fresh();
-        const local     = Store.loadLocal();
-        const localFull = local ? { ...base, ...local } : base;
-        const shared    = readSharedCapture();   // PWA "share to GTD" → straight into the Inbox
-        setItems(localFull);
-        (async () => {
-          const [server, drive] = await Promise.all([ Store.fetchServer(), Drive.pull() ]);
-          const winner = pickNewest([
-            { src:"local", data: local || null },
-            { src:"flask", data: server || null },
-            { src:"drive", data: drive && drive.data ? drive.data : null },
-          ]);
-          let chosen = winner && winner.data ? { ...base, ...winner.data } : localFull;
-          // graft a shared capture onto the reconciled state and re-stamp so it wins everywhere
-          if (shared) chosen = { ...chosen, inbox:[mk(shared), ...(chosen.inbox||[])], _updatedAt: Date.now() };
-          if (shared || (winner && winner.src !== "local")) { setItems(chosen); Store.saveLocal(chosen); }
-          const cT = chosen._updatedAt || 0;
-          if (!server || (server._updatedAt || 0) < cT) Store.pushServer(chosen);             // push to Flask if behind
-          if (Drive.enabled() && (!drive || ((drive.data && drive.data._updatedAt) || 0) < cT)) Drive.push(chosen);
-          lastSyncRef.current = Date.now();
-          setSyncTick(t => t + 1);
-        })();
+      // ── adopt a merged state if it differs from what's on screen. The merge is
+      //    re-run against the CURRENT items so edits made while a sync was in
+      //    flight are never clobbered (merging is idempotent). ──
+      const adopt = useCallback(merged => {
+        const cur   = itemsRef.current || fresh();
+        const final = mergeStates(cur, merged);
+        if (!sameState(final, cur)) setItems(final);
+        Store.saveLocal(final);
+        return final;
       }, []);
 
-      // ── poll OneDrive for changes made on other devices (Graph has no push) ──
+      // ── full reconcile with every reachable remote (Flask hub + OneDrive):
+      //    pull → item-level merge → adopt → push back whichever remote differs.
+      //    Also rotates old Done items into the archive store and syncs it. ──
+      const fullSync = useCallback(async () => {
+        const cur = itemsRef.current || fresh();
+        const [server, drive, sArch, dArch] = await Promise.all([
+          Store.fetchServer(), Drive.pull(), Store.fetchServerArchive(), Drive.pullArchive(),
+        ]);
+        let merged = mergeStates(cur, server);
+        if (drive && drive.data) merged = mergeStates(merged, drive.data);
+        let arch = mergeArchive(mergeArchive(archiveRef.current, sArch), dArch && dArch.data);
+        const rot = splitArchive(merged, arch);
+        if (rot) { merged = rot.state; arch = rot.archive; }
+        const final = adopt(merged);
+        if (!sameState(arch, archiveRef.current) || rot) setArchive(arch);
+        if (!sameState(server, final)) Store.pushServer(final);
+        if (Drive.enabled() && (!drive || !sameState(drive.data, final))) {
+          const res = await Drive.push(final);
+          if (res.merged) adopt(res.merged);
+        }
+        const archOutdated = rem => !Array.isArray(rem) || rem.length !== arch.length;
+        if (arch.length && archOutdated(sArch)) Store.pushServerArchive(arch);
+        if (Drive.enabled() && arch.length && archOutdated(dArch && dArch.data)) Drive.pushArchive(arch);
+        lastSyncRef.current = Date.now();
+        setSyncTick(t => t + 1);
+      }, [adopt]);
+      const fullSyncRef = React.useRef(fullSync);
+      useEffect(() => { fullSyncRef.current = fullSync; }, [fullSync]);
+
+      // ── offline-first load: show local immediately (migrated to schema v2),
+      //    then run a full reconcile against the optional remotes. ──
       useEffect(() => {
-        if (!Drive.available()) return;
+        const local  = Store.loadLocal() || fresh();
+        const shared = readSharedCapture();   // PWA "share to GTD" → straight into the Inbox
+        const seeded = shared ? stampChanges(local, { ...local, inbox:[mk(shared), ...local.inbox] }) : local;
+        itemsRef.current = seeded; setItems(seeded); Store.saveLocal(seeded);
+        archiveRef.current = Store.loadArchive(); setArchiveState(archiveRef.current);
+        fullSyncRef.current();
+      }, []);
+
+      // ── poll the remotes for other devices' changes (Graph has no push; the
+      //    Flask hub is plain HTTP). Cheap merge — adopts/pushes only on change. ──
+      useEffect(() => {
         const id = setInterval(async () => {
-          if (!Drive.enabled()) return;
-          const remote = await Drive.pull();
-          if (!remote || !remote.data) return;
+          const [server, drive] = await Promise.all([
+            Store.fetchServer(),
+            Drive.enabled() ? Drive.pull() : Promise.resolve(null),
+          ]);
+          if (!server && !(drive && drive.data)) return;
           const cur = itemsRef.current || fresh();
-          if ((remote.data._updatedAt || 0) > (cur._updatedAt || 0)) {
-            const merged = { ...fresh(), ...remote.data };
-            setItems(merged); Store.saveLocal(merged); Store.pushServer(merged);
-            lastSyncRef.current = Date.now(); setSyncTick(t => t + 1);
+          let merged = mergeStates(cur, server);
+          if (drive && drive.data) merged = mergeStates(merged, drive.data);
+          const final = adopt(merged);
+          if (!sameState(final, cur)) { lastSyncRef.current = Date.now(); setSyncTick(t => t + 1); }
+          if (server && !sameState(server, final)) Store.pushServer(final);
+          if (drive && !sameState(drive.data, final)) {
+            const res = await Drive.push(final);
+            if (res.merged) adopt(res.merged);
           }
         }, 45000);
         return () => clearInterval(id);
-      }, []);
+      }, [adopt]);
 
       // debounced push to OneDrive so rapid edits don't spam Graph
       const drivePush = useCallback(d => {
         if (!Drive.enabled()) return;
         if (driveTimer.current) clearTimeout(driveTimer.current);
         driveTimer.current = setTimeout(() => {
-          Drive.push(d).then(ok => { if (ok) { lastSyncRef.current = Date.now(); setSyncTick(t => t + 1); } });
+          Drive.push(d).then(res => {
+            if (!res.ok) return;
+            if (res.merged) adopt(res.merged);
+            lastSyncRef.current = Date.now(); setSyncTick(t => t + 1);
+          });
         }, 2000);
-      }, []);
+      }, [adopt]);
 
       const persist = useCallback(d => {
         Store.saveLocal(d);
@@ -491,23 +704,11 @@
         drivePush(d);
       }, [drivePush]);
 
-      // ── OneDrive connect / disconnect / manual sync ──
+      // ── manual "Sync now" — the same full reconcile the app runs at load ──
       const syncNow = useCallback(async () => {
-        if (!Drive.enabled()) return;
         setSyncing(true);
-        try {
-          const remote = await Drive.pull();
-          const cur    = itemsRef.current || fresh();
-          const rT     = (remote && remote.data && remote.data._updatedAt) || 0;
-          if (rT > (cur._updatedAt || 0)) {                // remote newer → adopt
-            const merged = { ...fresh(), ...remote.data };
-            setItems(merged); Store.saveLocal(merged); Store.pushServer(merged);
-          } else {                                         // local newer/equal → push up
-            await Drive.push(cur);
-          }
-          lastSyncRef.current = Date.now(); setSyncTick(t => t + 1);
-        } finally { setSyncing(false); }
-      }, []);
+        try { await fullSync(); } finally { setSyncing(false); }
+      }, [fullSync]);
 
       const connectDrive = useCallback(async () => {
         if (typeof msal === "undefined") {        // MSAL CDN didn't load — don't fail silently
@@ -533,8 +734,10 @@
         await Drive.disconnect(); setOdAccount(null); setSyncTick(t => t + 1);
       }, []);
 
+      // Every mutation flows through here: stampChanges gives each touched item a
+      // fresh per-item _updatedAt (the merge clock) — call sites never stamp.
       const upd = useCallback(d => {
-        const stamped = withStamp(d);
+        const stamped = stampChanges(items, d);
         setHistory(h => [...h.slice(-19), items]);
         setItems(stamped);
         persist(stamped);
@@ -542,11 +745,13 @@
 
       const undo = useCallback(() => {
         if (history.length === 0) return;
-        const prev = withStamp(history[history.length - 1]);
+        // stampChanges re-stamps everything the undo restores, so the revert also
+        // wins the merge against remotes (including un-deleting past a tombstone).
+        const prev = stampChanges(items, history[history.length - 1]);
         setHistory(h => h.slice(0, -1));
         setItems(prev);
         persist(prev);
-      }, [history, persist]);
+      }, [history, items, persist]);
 
       useEffect(() => {
         const onKey = e => { if ((e.ctrlKey||e.metaKey) && e.key==="z" && !e.shiftKey) { e.preventDefault(); undo(); } };
@@ -567,9 +772,20 @@
           try { parsed = JSON.parse(reader.result); }
           catch { alert("Could not read that file — is it a valid GTD backup (.json)?"); return; }
           if (!looksLikeState(parsed)) { alert("That doesn't look like a GTD backup file."); return; }
-          const next = importMode.current === "replace"
-            ? { ...fresh(), ...pickLists(parsed), _reviewedAt: parsed._reviewedAt||0, ...(parsed._reviewDay!=null?{_reviewDay:parsed._reviewDay}:{}) }
-            : mergeStates(items, parsed);
+          const mig  = migrate(parsed);   // old v1 backups are upgraded transparently
+          // Replace = restore: tombstone everything NOT in the backup, so synced
+          // devices converge to the backup instead of merging old items back in.
+          const next = importMode.current === "replace" ? (() => {
+            const keep = new Set(); LISTS.forEach(l=>(mig[l]||[]).forEach(i=>keep.add(i.id)));
+            const tombs = { ...mig.tombstones };
+            LISTS.forEach(l=>(items[l]||[]).forEach(i=>{ if(!keep.has(i.id)) tombs[i.id]=Date.now(); }));
+            return { ...mig, tombstones: tombs };
+          })() : mergeStates(items, mig);
+          if (Array.isArray(parsed.archive) && parsed.archive.length) {
+            setArchive(importMode.current === "replace" ? parsed.archive : mergeArchive(archiveRef.current, parsed.archive));
+          } else if (importMode.current === "replace") {
+            setArchive([]);
+          }
           upd(next);
           setShowData(false);
           alert(importMode.current === "replace" ? "Data replaced from backup." : "Backup merged in.");
@@ -586,7 +802,9 @@
 
       const addItem = () => {
         if (!form.title.trim()) return;
-        const item = { ...mk(form.title), context:form.context, dueDate:form.dueDate, dueTime:form.dueDate?form.dueTime:"", startDate:form.startDate, waitingFor:form.waitingFor, energy:active==="next"?form.energy:"", time:active==="next"?form.time:"" };
+        // "[Project] action" typed into Next/Waiting links to that project by id
+        const linked = (active==="next"||active==="waiting") ? linkByPrefix(form.title, items) : { title:form.title.trim(), projectId:"" };
+        const item = { ...mk(linked.title), projectId:linked.projectId, context:form.context, dueDate:form.dueDate, dueTime:form.dueDate?form.dueTime:"", startDate:form.startDate, waitingFor:form.waitingFor, energy:active==="next"?form.energy:"", time:active==="next"?form.time:"" };
         upd({ ...items, [active]:[item,...items[active]] });
         setForm({title:"",context:"@anywhere",dueDate:"",dueTime:"",startDate:"",waitingFor:"",energy:"",time:""}); setShowForm(false);
       };
@@ -597,26 +815,26 @@
         setProcItem(null);
       };
 
-      const del = (list, id) => upd({ ...items, [list]:items[list].filter(i=>i.id!==id) });
+      // Permanent delete — tombstoned so the deletion propagates through merge
+      // instead of the item resurrecting from another device. (Ctrl+Z still
+      // undoes it: the restore is re-stamped newer than the tombstone.)
+      const del = (list, id) => upd({ ...items, [list]:items[list].filter(i=>i.id!==id),
+                                      tombstones:{ ...items.tombstones, [id]: Date.now() } });
 
-      // Edit an item's own fields in place. For next/waiting, reattach the [Project]
-      // prefix the editor stripped. Renaming a project cascades to its linked actions'
-      // prefixes (the link is title-based — see exProj) so it doesn't go stale/stalled.
+      // Edit an item's own fields in place. Project↔action links are by id since
+      // schema v2, so renaming a project needs no cascade — links can't go stale.
       const applyEdit = (list, item, patch) => {
         if (list==="projects") {
-          const oldName=item.title, newName=patch.title;
-          const projects = items.projects.map(p => p.id===item.id ? {...p, title:newName, dueDate:patch.dueDate, dueTime:patch.dueTime, startDate:patch.startDate} : p);
-          if (oldName===newName) { upd({ ...items, projects }); return; }
-          const relink = arr => arr.map(a =>
-            exProj(a.title)===oldName ? { ...a, title:`[${newName}]${a.title.slice(oldName.length+2)}` } : a);
-          upd({ ...items, projects, next:relink(items.next), waiting:relink(items.waiting) });
+          upd({ ...items, projects: items.projects.map(p => p.id===item.id
+            ? {...p, title:patch.title, dueDate:patch.dueDate, dueTime:patch.dueTime, startDate:patch.startDate} : p) });
           return;
         }
-        const newTitle = patch.pname ? `[${patch.pname}] ${patch.title}` : patch.title;
         // base the merge on the STORED item (not the passed one) — Today/Calendar pass a
         // view object carrying _list/_kind that must not leak into persisted state.
         upd({ ...items, [list]: items[list].map(i => i.id===item.id
-          ? { ...i, title:newTitle, context:patch.context, dueDate:patch.dueDate, dueTime:patch.dueTime, startDate:patch.startDate, waitingFor:patch.waitingFor, energy:patch.energy, time:patch.time }
+          ? { ...i, title:patch.title, projectId:patch.projectId!==undefined?patch.projectId:i.projectId,
+              context:patch.context, dueDate:patch.dueDate, dueTime:patch.dueTime, startDate:patch.startDate,
+              waitingFor:patch.waitingFor, energy:patch.energy, time:patch.time }
           : i) });
       };
 
@@ -629,12 +847,14 @@
       const handleStalledDecision = (decision, proj, extra) => {
         let n = { ...items };
         if (decision==="next" && extra) {
-          const a = { ...mk(`[${proj.title}] ${extra.title}`), context:extra.context, dueDate:extra.dueDate };
+          const a = { ...mk(extra.title), projectId:proj.id, context:extra.context, dueDate:extra.dueDate };
           n = { ...n, next:[a,...n.next] };
         }
         if (decision==="waiting" && extra) {
-          const w = { ...mk(`[${proj.title}] ${extra.waitingFor}`), waitingFor:extra.waitingFor };
-          n = { ...n, waiting:[w,...n.waiting], projects:n.projects.filter(p=>p.id!==proj.id) };
+          // GTD: a delegated step IS the project's next move — the project stays
+          // active (and no longer counts as stalled) with a linked Waiting For.
+          const w = { ...mk(extra.waitingFor), waitingFor:extra.waitingFor, projectId:proj.id };
+          n = { ...n, waiting:[w,...n.waiting] };
         }
         if (decision==="someday")
           n = { ...n, projects:n.projects.filter(p=>p.id!==proj.id), someday:[proj,...n.someday] };
@@ -645,21 +865,25 @@
 
       const confirmComplete = (list, id, decision, nextAct) => {
         const item = items[list].find(i=>i.id===id); if (!item) return;
-        const pname = exProj(item.title);
+        const pid = item.projectId || "";
         let n = { ...items, [list]:items[list].filter(i=>i.id!==id), done:[{...item,doneAt:ts()},...items.done] };
         if (decision==="next" && nextAct) n = { ...n, next:[nextAct,...n.next] };
-        if (decision==="close" && pname) {
-          const p = n.projects.find(p=>p.title.toLowerCase()===pname.toLowerCase());
-          if (p) n = { ...n, projects:n.projects.filter(x=>x.id!==p.id), done:[{...p,doneAt:ts()},...n.done] };
+        if (decision==="close" && pid) {
+          const p = n.projects.find(p=>p.id===pid);
+          if (p) n = { ...n, projects:n.projects.filter(x=>x.id!==pid), done:[{...p,doneAt:ts()},...n.done] };
         }
-        if (decision==="waiting" && nextAct && pname) {
-          const waitItem = { ...mk(`[${pname}] ${nextAct.waitingFor}`), waitingFor:nextAct.waitingFor };
+        if (decision==="waiting" && nextAct && pid) {
+          const waitItem = { ...mk(nextAct.waitingFor), waitingFor:nextAct.waitingFor, projectId:pid };
           n = { ...n, waiting:[waitItem,...n.waiting] };
         }
-        if (decision==="someday" && pname) {
-          const p = n.projects.find(p=>p.title.toLowerCase()===pname.toLowerCase());
-          if (p) n = { ...n, projects:n.projects.filter(x=>x.id!==p.id), someday:[p,...n.someday] };
-          n = { ...n, next:n.next.filter(a=>exProj(a.title)!==pname) };
+        if (decision==="someday" && pid) {
+          const p = n.projects.find(p=>p.id===pid);
+          if (p) n = { ...n, projects:n.projects.filter(x=>x.id!==pid), someday:[p,...n.someday] };
+          // remaining next actions of a deferred project step back too (tombstoned
+          // so the removal propagates; the project keeps its outcome in Someday)
+          const dropIds = n.next.filter(a=>a.projectId===pid).map(a=>a.id);
+          n = { ...n, next:n.next.filter(a=>a.projectId!==pid),
+                tombstones:{ ...n.tombstones, ...Object.fromEntries(dropIds.map(x=>[x, Date.now()])) } };
         }
         upd(n); setComplCand(null);
       };
@@ -697,8 +921,9 @@
       React.useEffect(() => {
         if (!pipOn || !pipRootRef.current || !items) return;
         const today = isoDate(new Date());
+        const pm    = projIndex(items);
         pipRootRef.current.render(
-          <FloatToday items={items} todayISO={today}
+          <FloatToday items={items} todayISO={today} pnameOf={i=>(i&&i.projectId&&pm.get(i.projectId))||null}
             onComplete={(list,it)=>confirmComplete(list,it.id,"later",null)}
             onToggleFocus={toggleFocus}
             onCapture={t=>upd({ ...items, inbox:[mk(t), ...items.inbox] })}
@@ -740,8 +965,14 @@
         }));
         return { count, overdue };
       })();
-      const projActions = {};
-      (items.next||[]).forEach(a=>{ const p=exProj(a.title); if(p) (projActions[p]=projActions[p]||[]).push(a); });
+      // Project link helpers (id-based since schema v2)
+      const pmap    = projIndex(items);                                            // id → project title
+      const pnameOf = i => (i && i.projectId && pmap.get(i.projectId)) || null;    // for chips/grouping
+      const ctxs    = (items.contexts && items.contexts.length) ? items.contexts : CONTEXTS;
+      const projActions = {};   // projectId → linked next actions
+      const projWaiting = {};   // projectId → linked waiting-for items
+      (items.next||[]).forEach(a=>{ if(a.projectId) (projActions[a.projectId]=projActions[a.projectId]||[]).push(a); });
+      (items.waiting||[]).forEach(a=>{ if(a.projectId) (projWaiting[a.projectId]=projWaiting[a.projectId]||[]).push(a); });
 
       // Weekly Review cadence (GTD's keystone Reflect habit). _reviewedAt is a synced
       // state timestamp; _reviewDay is the chosen review weekday (0=Sun … 6=Sat, default
@@ -858,7 +1089,7 @@
 
             {active==="next" && (
               <div style={{padding:"8px 22px",background:"#fff",borderBottom:"1px solid var(--line)",display:"flex",gap:6,flexWrap:"wrap",alignItems:"center",flexShrink:0}}>
-                {["all",...CONTEXTS].map(c=>(
+                {["all",...ctxs].map(c=>(
                   <button key={c} onClick={()=>setCtx(c)} className={"chip"+(ctx===c?" on":"")}>
                     {c==="all"?"All":c}
                   </button>
@@ -892,7 +1123,7 @@
                     {active==="next" && (
                       <label className="fld"><span>Context</span>
                         <select className="in in-sm" value={form.context} onChange={e=>setForm({...form,context:e.target.value})}>
-                          {CONTEXTS.map(c=><option key={c}>{c}</option>)}
+                          {ctxs.map(c=><option key={c}>{c}</option>)}
                         </select>
                       </label>
                     )}
@@ -935,13 +1166,13 @@
 
             <div style={{flex:1,overflowY:"auto",padding:"14px 22px"}}>
               {active==="today" ? (
-                <TodayView items={items} todayISO={todayISO} reviewDue={reviewDue} daysSinceReview={daysSinceReview}
+                <TodayView items={items} todayISO={todayISO} pnameOf={pnameOf} reviewDue={reviewDue} daysSinceReview={daysSinceReview}
                   onComplete={(list,item)=>setComplCand({list,item})}
                   onToggleFocus={toggleFocus}
                   onEdit={(list,item)=>setEditCand({list,item})}
                   onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}/>
               ) : active==="calendar" ? (
-                <CalendarView items={items}
+                <CalendarView items={items} pnameOf={pnameOf}
                   onComplete={(list,item)=>setComplCand({list,item})}
                   onEdit={(list,item)=>setEditCand({list,item})}
                   onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}/>
@@ -954,15 +1185,15 @@
                 shown.length===0
                   ? <EmptyState list="projects"/>
                   : shown.map(p=>(
-                      <ProjCard key={p.id} proj={p} actions={projActions[p.title]||[]}
+                      <ProjCard key={p.id} proj={p} actions={projActions[p.id]||[]} waiting={projWaiting[p.id]||[]} ctxs={ctxs}
                         onDelete={()=>del("projects",p.id)}
                         onEdit={()=>setEditCand({list:"projects",item:p})}
-                        onCompleteAction={id=>setComplCand({list:"next",item:(items.next||[]).find(i=>i.id===id)})}
-                        onDeleteAction={id=>del("next",id)}
+                        onCompleteAction={(l,id)=>setComplCand({list:l,item:(items[l]||[]).find(i=>i.id===id)})}
+                        onDeleteAction={(l,id)=>del(l,id)}
                         onStalledDecision={handleStalledDecision}/>
                     ))
               ) : active==="done" ? (
-                <DoneView items={shown} move={move} del={del}/>
+                <DoneView items={shown} pnameOf={pnameOf} archiveCount={archive.length} move={move} del={del}/>
               ) : active==="inbox" ? (
                 shown.length===0
                   ? <EmptyState list="inbox"/>
@@ -973,7 +1204,7 @@
               ) : (
                 <div style={{display:"flex",flexDirection:"column",gap:6}}>
                   {liveShown.map(item=>(
-                    <ItemCard key={item.id} item={item} list={active}
+                    <ItemCard key={item.id} item={item} list={active} pname={pnameOf(item)}
                       onComplete={()=>setComplCand({list:active,item})}
                       onDelete={()=>del(active,item.id)}
                       onProcess={null}
@@ -990,7 +1221,7 @@
                   {deferredShown.length>0 && (
                     <DeferredSection count={deferredShown.length}>
                       {deferredShown.map(item=>(
-                        <ItemCard key={item.id} item={item} list={active}
+                        <ItemCard key={item.id} item={item} list={active} pname={pnameOf(item)}
                           onComplete={()=>setComplCand({list:active,item})}
                           onDelete={()=>del(active,item.id)}
                           onProcess={null}
@@ -1014,8 +1245,14 @@
             onChange={onImportFile} style={{display:"none"}}/>
 
           {showData && (
-            <DataModal counts={counts}
-              onExport={()=>exportData(items)}
+            <DataModal counts={counts} archiveCount={archive.length}
+              contexts={ctxs}
+              onAddContext={c=>{ let x=(c||"").trim(); if(!x) return; if(!x.startsWith("@")) x="@"+x;
+                                 if(items.contexts.some(e=>e.toLowerCase()===x.toLowerCase())) return;
+                                 upd({ ...items, contexts:[...items.contexts, x] }); }}
+              onDelContext={c=>{ if(c==="@anywhere") return;   // the neutral default stays
+                                 upd({ ...items, contexts:items.contexts.filter(x=>x!==c) }); }}
+              onExport={()=>exportData({ ...items, archive })}
               onImport={triggerImport}
               cloud={{
                 ready: odReady, configured: !!MS_CLIENT_ID,
@@ -1028,7 +1265,7 @@
 
           {complCand && complCand.item && (
             <CompleteModal item={complCand.item} list={complCand.list}
-              projectItems={items.projects}
+              pname={pnameOf(complCand.item)} ctxs={ctxs}
               onConfirm={(d,a)=>confirmComplete(complCand.list,complCand.item.id,d,a)}
               onClose={()=>setComplCand(null)}/>
           )}
@@ -1036,12 +1273,10 @@
           {promoteCand && (
             <PromoteModal item={promoteCand}
               onConfirm={outcome=>{
-                const actionText = promoteCand.title.replace(/^\[[^\]]+\]\s*/,"");
                 const proj = {...mk(outcome), dueDate:promoteCand.dueDate||""};
-                const linked = {...promoteCand, title:`[${outcome}] ${actionText}`};
                 upd({
                   ...items,
-                  next: items.next.map(a=>a.id===promoteCand.id?linked:a),
+                  next: items.next.map(a=>a.id===promoteCand.id?{...a, projectId:proj.id}:a),
                   projects: [proj, ...items.projects],
                 });
                 setPromoteCand(null);
@@ -1049,21 +1284,21 @@
               onClose={()=>setPromoteCand(null)}/>
           )}
           {editCand && (
-            <EditModal item={editCand.item} list={editCand.list}
+            <EditModal item={editCand.item} list={editCand.list} ctxs={ctxs} projects={items.projects}
               onConfirm={patch => { applyEdit(editCand.list, editCand.item, patch); setEditCand(null); }}
               onClose={()=>setEditCand(null)}/>
           )}
           {procItem && (
-            <ProcessModal item={procItem}
+            <ProcessModal item={procItem} ctxs={ctxs}
               onMove={(to,patch)=>move("inbox",procItem.id,to,patch)}
               onMoveAsProject={(patch, first) => {
                 const src = items.inbox.find(i=>i.id===procItem.id); if (!src) return;
                 let n = {...items, inbox:items.inbox.filter(i=>i.id!==procItem.id), projects:[{...src,...patch},...items.projects]};
                 if (first.type==="next") {
-                  const a = {...mk(`[${src.title}] ${first.title}`), context:first.context, dueDate:first.dueDate, dueTime:first.dueTime||"", startDate:first.startDate};
+                  const a = {...mk(first.title), projectId:src.id, context:first.context, dueDate:first.dueDate, dueTime:first.dueTime||"", startDate:first.startDate};
                   n = {...n, next:[a,...n.next]};
                 } else {
-                  const w = {...mk(`[${src.title}] ${first.waitingFor}`), waitingFor:first.waitingFor};
+                  const w = {...mk(first.waitingFor), waitingFor:first.waitingFor, projectId:src.id};
                   n = {...n, waiting:[w,...n.waiting]};
                 }
                 upd(n); setProcItem(null);
@@ -1090,10 +1325,15 @@
     }
 
     // ── DoneView / DoneGroup ──────────────────────────────────────
-    function DoneView({ items, move, del }) {
+    function DoneView({ items, pnameOf, archiveCount, move, del }) {
       const [groupBy, setGroupBy] = useState("time");
-      if (items.length === 0) return <EmptyState list="done"/>;
-      const groups = groupBy==="time" ? doneByTime(items) : doneByProject(items);
+      const archiveNote = archiveCount > 0 && (
+        <div style={{fontSize:11,color:"#94a3b8",padding:"10px 2px 0"}}>
+          🗄 {archiveCount} older item{archiveCount!==1?"s":""} in the archive (rotated out after {ARCHIVE_DAYS} days — included in backup files).
+        </div>
+      );
+      if (items.length === 0) return <div><EmptyState list="done"/>{archiveNote}</div>;
+      const groups = groupBy==="time" ? doneByTime(items) : doneByProject(items, pnameOf);
       return (
         <div>
           <div style={{display:"flex",gap:5,marginBottom:12}}>
@@ -1102,15 +1342,16 @@
             ))}
           </div>
           {groups.map(g=>(
-            <DoneGroup key={g.label} group={g}
+            <DoneGroup key={g.label} group={g} pnameOf={pnameOf}
               onRestore={id=>move("done",id,"next",{doneAt:undefined})}
               onDelete={id=>del("done",id)}/>
           ))}
+          {archiveNote}
         </div>
       );
     }
 
-    function DoneGroup({ group, onRestore, onDelete }) {
+    function DoneGroup({ group, pnameOf, onRestore, onDelete }) {
       const [open, setOpen] = useState(group.defaultOpen);
       return (
         <div style={{marginBottom:8}}>
@@ -1125,7 +1366,7 @@
           {open&&(
             <div style={{display:"flex",flexDirection:"column",gap:5,paddingLeft:4}}>
               {group.items.map(item=>(
-                <ItemCard key={item.id} item={item} list="done"
+                <ItemCard key={item.id} item={item} list="done" pname={pnameOf?pnameOf(item):null}
                   onRestore={()=>onRestore(item.id)}
                   onDelete={()=>onDelete(item.id)}/>
               ))}
@@ -1136,14 +1377,17 @@
     }
 
     // ── ProjCard ──────────────────────────────────────────────────
-    function ProjCard({ proj, actions, onDelete, onEdit, onCompleteAction, onDeleteAction, onStalledDecision }) {
+    function ProjCard({ proj, actions, waiting, ctxs, onDelete, onEdit, onCompleteAction, onDeleteAction, onStalledDecision }) {
       const [open, setOpen]           = useState(false);
       const [stalledPhase, setStalledPhase] = useState(null); // null | "define" | "waiting"
       const [naTitle, setNaTitle]     = useState("");
       const [naCtx,   setNaCtx]       = useState("@anywhere");
       const [naDue,   setNaDue]       = useState("");
       const [waitTxt, setWaitTxt]     = useState("");
-      const stalled = actions.length===0;
+      // A project with a linked Waiting For isn't stalled — the ball is in someone
+      // else's court, which is a legitimate GTD "next move".
+      const stalled = actions.length===0 && waiting.length===0;
+      const delegated = actions.length===0 && waiting.length>0;
 
       const resetStalled = () => { setStalledPhase(null); setNaTitle(""); setNaDue(""); setWaitTxt(""); };
 
@@ -1155,8 +1399,9 @@
               <div style={{fontWeight:600,fontSize:13,display:"flex",alignItems:"center",gap:7}}>
                 📋 {proj.title}
                 {stalled && <span style={{fontSize:10,background:"#fef9c3",color:"#92400e",padding:"1px 7px",borderRadius:20,fontWeight:700}}>⚠️ stalled</span>}
+                {delegated && <span style={{fontSize:10,background:"#eff6ff",color:"#1e40af",padding:"1px 7px",borderRadius:20,fontWeight:700}}>⏳ waiting</span>}
               </div>
-              <div style={{fontSize:11,color:"#64748b",marginTop:2}}>{actions.length} active action{actions.length!==1?"s":""}{proj.dueDate?` · 📅 ${proj.dueDate}`:""}</div>
+              <div style={{fontSize:11,color:"#64748b",marginTop:2}}>{actions.length} active action{actions.length!==1?"s":""}{waiting.length?` · ${waiting.length} waiting`:""}{proj.dueDate?` · 📅 ${proj.dueDate}`:""}</div>
             </div>
             {onEdit&&(
               <button onClick={e=>{e.stopPropagation();onEdit();}} title="Edit" className="ibtn" style={{fontSize:13}}>✎</button>
@@ -1208,7 +1453,7 @@
                       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:8}}>
                         <select value={naCtx} onChange={e=>setNaCtx(e.target.value)}
                           style={{padding:"6px 8px",border:"1px solid #c4b5fd",borderRadius:7,fontSize:11,background:"#fff"}}>
-                          {CONTEXTS.map(c=><option key={c}>{c}</option>)}
+                          {ctxs.map(c=><option key={c}>{c}</option>)}
                         </select>
                         <input type="date" value={naDue} onChange={e=>setNaDue(e.target.value)}
                           style={{padding:"6px 8px",border:"1px solid #c4b5fd",borderRadius:7,fontSize:11}}/>
@@ -1254,20 +1499,39 @@
                 <div style={{display:"flex",flexDirection:"column",gap:5}}>
                   {actions.map(a=>(
                     <div key={a.id} style={{display:"flex",alignItems:"flex-start",gap:8,padding:"7px 8px",background:"#f8fafc",borderRadius:7,border:"1px solid #e2e8f0"}}>
-                      <button onClick={()=>onCompleteAction(a.id)}
+                      <button onClick={()=>onCompleteAction("next",a.id)}
                         style={{width:17,height:17,borderRadius:"50%",border:"2px solid #cbd5e1",background:"#fff",cursor:"pointer",flexShrink:0,marginTop:1}}
                         onMouseEnter={e=>e.target.style.borderColor="#6366f1"}
                         onMouseLeave={e=>e.target.style.borderColor="#cbd5e1"}/>
                       <div style={{flex:1,minWidth:0}}>
                         <div style={{fontSize:12,fontWeight:500,wordBreak:"break-word"}}>
-                          {a.title.replace(/^\[[^\]]+\]\s*/,"")}
+                          {a.title}
                         </div>
                         <div style={{display:"flex",gap:5,marginTop:3,flexWrap:"wrap"}}>
                           {a.context&&a.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{a.context}</Tag>}
                           {a.dueDate&&<Tag bg={isOver(a.dueDate)?"#fef2f2":"#f0fdf4"} c={isOver(a.dueDate)?"#b91c1c":"#166534"}>{isOver(a.dueDate)?"⚠️ ":"📅 "}{dueLabel(a.dueDate,a.dueTime)}</Tag>}
                         </div>
                       </div>
-                      <button onClick={()=>onDeleteAction(a.id)}
+                      <button onClick={()=>onDeleteAction("next",a.id)}
+                        style={{background:"none",border:"none",cursor:"pointer",color:"#cbd5e1",fontSize:15,lineHeight:1}}
+                        onMouseEnter={e=>e.target.style.color="#ef4444"}
+                        onMouseLeave={e=>e.target.style.color="#cbd5e1"}>×</button>
+                    </div>
+                  ))}
+                  {waiting.map(w=>(
+                    <div key={w.id} style={{display:"flex",alignItems:"flex-start",gap:8,padding:"7px 8px",background:"#fffbeb",borderRadius:7,border:"1px solid #fde68a"}}>
+                      <button onClick={()=>onCompleteAction("waiting",w.id)} title="Received / resolved"
+                        style={{width:17,height:17,borderRadius:"50%",border:"2px solid #fcd34d",background:"#fff",cursor:"pointer",flexShrink:0,marginTop:1}}
+                        onMouseEnter={e=>e.target.style.borderColor="#f59e0b"}
+                        onMouseLeave={e=>e.target.style.borderColor="#fcd34d"}/>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:12,fontWeight:500,wordBreak:"break-word"}}>⏳ {w.title}</div>
+                        <div style={{display:"flex",gap:5,marginTop:3,flexWrap:"wrap"}}>
+                          {w.waitingFor&&<Tag bg="#fffbeb" c="#b45309">👤 {w.waitingFor}</Tag>}
+                          {w.dueDate&&<Tag bg={isOver(w.dueDate)?"#fef2f2":"#f0fdf4"} c={isOver(w.dueDate)?"#b91c1c":"#166534"}>{isOver(w.dueDate)?"⚠️ ":"📅 "}{dueLabel(w.dueDate,w.dueTime)}</Tag>}
+                        </div>
+                      </div>
+                      <button onClick={()=>onDeleteAction("waiting",w.id)}
                         style={{background:"none",border:"none",cursor:"pointer",color:"#cbd5e1",fontSize:15,lineHeight:1}}
                         onMouseEnter={e=>e.target.style.color="#ef4444"}
                         onMouseLeave={e=>e.target.style.color="#cbd5e1"}>×</button>
@@ -1307,7 +1571,7 @@
     }
 
     // ── ItemCard ──────────────────────────────────────────────────
-    function ItemCard({ item, list, onComplete, onDelete, onProcess, onRestore, onMove, onPromote, onToggleFocus, onEdit, focused, currentList }) {
+    function ItemCard({ item, list, pname, onComplete, onDelete, onProcess, onRestore, onMove, onPromote, onToggleFocus, onEdit, focused, currentList }) {
       const [menuPos, setMenuPos] = useState(null);   // {top|bottom, right} in viewport coords, or null = closed
       const moveRef = React.useRef(null);
       const btnRef  = React.useRef(null);
@@ -1341,8 +1605,7 @@
         };
       }, [showMove]);
       const ov = isOver(item.dueDate) && list!=="done";
-      const pname = exProj(item.title);
-      const displayTitle = list==="next" && pname ? item.title.replace(/^\[[^\]]+\]\s*/,"") : item.title;
+      const displayTitle = item.title;   // titles are clean since v2 — the project link is a chip, not a prefix
       const MOVE_TARGETS = { next:["waiting","someday","reference"], waiting:["next","someday"], someday:["next","waiting","projects"], projects:["next","waiting","someday"], reference:["next","someday"] };
       const targets = onMove ? (MOVE_TARGETS[currentList]||[]) : [];
       const targetLabel = { next:"Next Actions", waiting:"Waiting For", someday:"Someday/Maybe", projects:"Projects", reference:"Reference" };
@@ -1361,7 +1624,7 @@
             </div>
           )}
           <div style={{flex:1,minWidth:0}}>
-            {pname&&list==="next"&&(
+            {pname&&list!=="projects"&&(
               <div style={{fontSize:10,color:"#7c3aed",fontWeight:600,marginBottom:2}}>📋 {pname}</div>
             )}
             <div style={{fontSize:13,fontWeight:500,textDecoration:list==="done"?"line-through":"none",color:list==="done"?"#94a3b8":"#1e293b",wordBreak:"break-word"}}>
@@ -1442,7 +1705,7 @@
     // "Focused today" = Next Actions you starred for today (ephemeral focusDate);
     // "Due today"/"Overdue" = the hard landscape (any dated list). Unfinished focus
     // simply isn't "today" tomorrow — it stays in Next Actions, no rollover guilt.
-    function TodayView({ items, todayISO, reviewDue, daysSinceReview, onComplete, onToggleFocus, onGoto, onEdit }) {
+    function TodayView({ items, todayISO, pnameOf, reviewDue, daysSinceReview, onComplete, onToggleFocus, onGoto, onEdit }) {
       const dateLabel = new Date(todayISO+"T00:00").toLocaleDateString("en-US",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
       const [hideReview, setHideReview] = useState(false);
 
@@ -1462,8 +1725,8 @@
       const total = overdue.length + focus.length + due.length + started.length;
 
       const Row = ({ i, ov }) => {
-        const pname = exProj(i.title);
-        const title = i._list==="next" && pname ? i.title.replace(/^\[[^\]]+\]\s*/,"") : i.title;
+        const pname = pnameOf(i);
+        const title = i.title;
         const foc   = i._list==="next" && i.focusDate===todayISO;
         return (
           <div style={{display:"flex",alignItems:"flex-start",gap:10,padding:"9px 11px",border:`1px solid ${ov?"#fca5a5":"#e2e8f0"}`,borderRadius:9,background:ov?"#fff7f7":"#fff"}}>
@@ -1474,7 +1737,7 @@
                 onMouseLeave={e=>e.target.style.borderColor="#cbd5e1"}/>
             ) : <span style={{fontSize:14,flexShrink:0,marginTop:1}}>📋</span>}
             <div style={{flex:1,minWidth:0}}>
-              {i._list==="next" && pname && <div style={{fontSize:10,color:"#7c3aed",fontWeight:600,marginBottom:2}}>📋 {pname}</div>}
+              {pname && <div style={{fontSize:10,color:"#7c3aed",fontWeight:600,marginBottom:2}}>📋 {pname}</div>}
               <div style={{fontSize:13,fontWeight:500,wordBreak:"break-word"}}>{title}</div>
               <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap",alignItems:"center"}}>
                 <Tag bg="#eef2ff" c="#4338ca">{META[i._list].icon} {META[i._list].label}</Tag>
@@ -1559,7 +1822,7 @@
     // App.openPip): an always-on-top floating panel to glance at today and capture
     // into the Inbox while working in other apps. Self-contained — every mutation is
     // passed in as a prop (it shares no React context with the main tree).
-    function FloatToday({ items, todayISO, onComplete, onToggleFocus, onCapture, onClose }) {
+    function FloatToday({ items, todayISO, pnameOf, onComplete, onToggleFocus, onCapture, onClose }) {
       const [tab, setTab]   = useState("today");
       const [text, setText] = useState("");
       const fire = () => { const t=text.trim(); if(!t) return; onCapture(t); setText(""); };
@@ -1610,7 +1873,7 @@
                 </div>
               ) : rows.map(i=>{
                 const [ic,col,bg,bd]=kindMeta[i._kind];
-                const pname=exProj(i.title), title=i._list==="next"&&pname?i.title.replace(/^\[[^\]]+\]\s*/,""):i.title;
+                const pname=pnameOf(i), title=i.title;
                 const foc=i._list==="next"&&i.focusDate===todayISO;
                 return (
                   <div key={i.id} style={{display:"flex",alignItems:"flex-start",gap:9,padding:"8px 10px",border:`1px solid ${bd}`,borderRadius:9,background:bg}}>
@@ -1658,7 +1921,7 @@
     // Read-mostly: click a day to inspect its items; complete or jump to the source
     // list from the day panel. Not a stored list — derives entirely from `items`.
     const WEEKDAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
-    function CalendarView({ items, onComplete, onGoto, onEdit }) {
+    function CalendarView({ items, pnameOf, onComplete, onGoto, onEdit }) {
       const today = new Date(); today.setHours(0,0,0,0);
       const todayISO = isoDate(today);
       const [cursor,   setCursor]   = useState(() => new Date(today.getFullYear(), today.getMonth(), 1));
@@ -1766,8 +2029,8 @@
                 {selItems.map(i=>{
                   const isStart = i._kind==="start";
                   const ov    = selected < todayISO && !isStart;   // a past start day isn't overdue
-                  const pname = exProj(i.title);
-                  const title = i._list==="next" && pname ? i.title.replace(/^\[[^\]]+\]\s*/,"") : i.title;
+                  const pname = pnameOf(i);
+                  const title = i.title;
                   return (
                     <div key={i.id+i._kind}
                       style={{display:"flex",alignItems:"flex-start",gap:10,padding:"9px 11px",border:`1px solid ${ov?"#fca5a5":"#e2e8f0"}`,borderRadius:9,background:ov?"#fff7f7":"#fff"}}>
@@ -1778,7 +2041,7 @@
                           onMouseLeave={e=>e.target.style.borderColor="#cbd5e1"}/>
                       ) : <span style={{fontSize:14,flexShrink:0,marginTop:1}}>📋</span>}
                       <div style={{flex:1,minWidth:0}}>
-                        {i._list==="next" && pname && <div style={{fontSize:10,color:"#7c3aed",fontWeight:600,marginBottom:2}}>📋 {pname}</div>}
+                        {pname && <div style={{fontSize:10,color:"#7c3aed",fontWeight:600,marginBottom:2}}>📋 {pname}</div>}
                         <div style={{fontSize:13,fontWeight:500,wordBreak:"break-word"}}>{title}</div>
                         <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap",alignItems:"center"}}>
                           <Tag bg="#eef2ff" c="#4338ca">{META[i._list].icon} {META[i._list].label}</Tag>
@@ -1824,9 +2087,11 @@
       const waiting = items.waiting||[];
       const staleWait = waiting.filter(w => w.created && (Date.now()-new Date(w.created)) > 7*86400000).length;
       const projects = items.projects||[];
-      const pa = {};
-      (items.next||[]).forEach(a=>{ const p=exProj(a.title); if(p)(pa[p]=pa[p]||[]).push(a); });
-      const stalled = projects.filter(p => !(pa[p.title]&&pa[p.title].length));
+      // A project is stalled when NOTHING moves it: no linked next action AND no
+      // linked waiting-for (delegated work counts as a next move — id-based links).
+      const linkedActive = new Set();
+      ["next","waiting"].forEach(l=>(items[l]||[]).forEach(a=>{ if(a.projectId) linkedActive.add(a.projectId); }));
+      const stalled = projects.filter(p => !linkedActive.has(p.id));
       let overdue=0, upcoming=0;
       DATED.forEach(l=>(items[l]||[]).forEach(i=>{ if(i.dueDate){ i.dueDate<todayISO ? overdue++ : upcoming++; }}));
 
@@ -1932,8 +2197,7 @@
     }
 
     // ── CompleteModal ─────────────────────────────────────────────
-    function CompleteModal({ item, list, projectItems, onConfirm, onClose }) {
-      const pname = exProj(item.title);
+    function CompleteModal({ item, list, pname, ctxs, onConfirm, onClose }) {
       const [phase, setPhase]         = useState(pname ? "decide" : "simple");
       const [nextTitle, setNextTitle] = useState("");
       const [nextCtx,   setNextCtx]   = useState(item.context||"@anywhere");
@@ -1963,7 +2227,7 @@
           <div style={box}>
             <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>Action complete ✓</div>
             <div style={{fontSize:12,color:"#64748b",marginBottom:12,fontStyle:"italic"}}>
-              "{item.title.replace(/^\[[^\]]+\]\s*/,"")}"
+              "{item.title}"
             </div>
             <div style={{background:"#f5f3ff",border:"1px solid #ddd6fe",borderRadius:8,padding:"8px 12px",marginBottom:14,fontSize:12,color:"#5b21b6"}}>
               📋 <strong>{pname}</strong>
@@ -2017,7 +2281,7 @@
               What is the very next <em>physical, visible</em> action?
             </div>
             <input autoFocus value={nextTitle} onChange={e=>setNextTitle(e.target.value)}
-              onKeyDown={e=>{ if(e.key==="Enter"&&nextTitle.trim()) onConfirm("next",{...mk(`[${pname}] ${nextTitle.trim()}`),context:nextCtx,dueDate:nextDue}); }}
+              onKeyDown={e=>{ if(e.key==="Enter"&&nextTitle.trim()) onConfirm("next",{...mk(nextTitle.trim()),projectId:item.projectId,context:nextCtx,dueDate:nextDue}); }}
               placeholder="e.g. Gọi điện cho anh Sơn về tiến độ"
               style={{width:"100%",padding:"8px 10px",border:"1px solid #d1d5db",borderRadius:8,fontSize:13,outline:"none",marginBottom:8}}/>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}}>
@@ -2025,7 +2289,7 @@
                 <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase",letterSpacing:".8px",marginBottom:4}}>Context</div>
                 <select value={nextCtx} onChange={e=>setNextCtx(e.target.value)}
                   style={{width:"100%",padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff"}}>
-                  {CONTEXTS.map(c=><option key={c}>{c}</option>)}
+                  {ctxs.map(c=><option key={c}>{c}</option>)}
                 </select>
               </div>
               <div>
@@ -2036,7 +2300,7 @@
             </div>
             <div style={{display:"flex",gap:8}}>
               <button
-                onClick={()=>{ if(nextTitle.trim()) onConfirm("next",{...mk(`[${pname}] ${nextTitle.trim()}`),context:nextCtx,dueDate:nextDue}); }}
+                onClick={()=>{ if(nextTitle.trim()) onConfirm("next",{...mk(nextTitle.trim()),projectId:item.projectId,context:nextCtx,dueDate:nextDue}); }}
                 disabled={!nextTitle.trim()}
                 style={{flex:1,padding:"9px",background:nextTitle.trim()?"#6366f1":"#e2e8f0",color:nextTitle.trim()?"#fff":"#94a3b8",border:"none",borderRadius:8,cursor:nextTitle.trim()?"pointer":"default",fontSize:13,fontWeight:600}}>
                 ✓ Done & add next action
@@ -2086,7 +2350,7 @@
 
     // ── PromoteModal — turn a single next action into a project ───
     function PromoteModal({ item, onConfirm, onClose }) {
-      const actionText = item.title.replace(/^\[[^\]]+\]\s*/,"");
+      const actionText = item.title;
       const [outcome, setOutcome] = useState("");
       const can = outcome.trim();
       const confirm = () => { if (can) onConfirm(outcome.trim()); };
@@ -2119,9 +2383,9 @@
     // Edit an existing item's own fields. Fields shown mirror the add form's
     // per-list rules. For project-linked actions the [Project] prefix is stripped
     // for editing and reattached on save (parent owns the title-link cascade).
-    function EditModal({ item, list, onConfirm, onClose }) {
-      const pname = exProj(item.title);
-      const [title,      setTitle]      = useState(list==="next"||list==="waiting" ? item.title.replace(/^\[[^\]]+\]\s*/,"") : item.title);
+    function EditModal({ item, list, ctxs, projects, onConfirm, onClose }) {
+      const [title,      setTitle]      = useState(item.title);
+      const [projectId,  setProjectId]  = useState(item.projectId||"");
       const [context,    setContext]    = useState(item.context||"@anywhere");
       const [dueDate,    setDueDate]    = useState(item.dueDate||"");
       const [dueTime,    setDueTime]    = useState(item.dueTime||"");
@@ -2132,24 +2396,39 @@
       const can = title.trim();
       const showCtx  = list==="next";
       const showWait = list==="waiting";
+      const showProj = list==="next"||list==="waiting";
       const showDue  = ["next","projects","waiting","someday"].includes(list);
-      const confirm = () => { if (can) onConfirm({ title:title.trim(), context, dueDate, dueTime:dueDate?dueTime:"", startDate, waitingFor:waitingFor.trim(), energy, time, pname }); };
+      // <option> values are strings; item ids are numbers — resolve back to the real id
+      const resolvePid = () => {
+        if (projectId==="") return "";
+        const hit = (projects||[]).find(p=>String(p.id)===String(projectId));
+        return hit ? hit.id : item.projectId;
+      };
+      const confirm = () => { if (can) onConfirm({ title:title.trim(), projectId:resolvePid(), context, dueDate, dueTime:dueDate?dueTime:"", startDate, waitingFor:waitingFor.trim(), energy, time }); };
       const lbl = {marginBottom:6};
       return (
         <div className="ov" onClick={e=>e.target===e.currentTarget&&onClose()}>
           <div className="mbox">
             <div style={{fontSize:14,fontWeight:700,marginBottom:14}}>Edit {META[list]?.label||"item"}</div>
-            {pname&&(list==="next"||list==="waiting")&&(
-              <div style={{fontSize:11,color:"#7c3aed",fontWeight:600,marginBottom:10}}>📋 {pname}</div>
-            )}
             <div className="slabel" style={lbl}>{list==="projects"?"Project outcome":"Title"}</div>
             <input autoFocus className="in" style={{marginBottom:14}} value={title} onChange={e=>setTitle(e.target.value)}
               onKeyDown={e=>e.key==="Enter"&&can&&confirm()}/>
+            {showProj&&(
+              <React.Fragment>
+                <div className="slabel" style={lbl}>Project</div>
+                <select className="in" style={{marginBottom:14}} value={projectId} onChange={e=>setProjectId(e.target.value)}>
+                  <option value="">— none —</option>
+                  {(projects||[]).map(p=><option key={p.id} value={p.id}>📋 {p.title}</option>)}
+                  {projectId && !(projects||[]).some(p=>String(p.id)===String(projectId)) &&
+                    <option value={projectId}>📋 (current link)</option>}
+                </select>
+              </React.Fragment>
+            )}
             {showCtx&&(
               <React.Fragment>
                 <div className="slabel" style={lbl}>Context</div>
                 <select className="in" style={{marginBottom:14}} value={context} onChange={e=>setContext(e.target.value)}>
-                  {CONTEXTS.map(c=><option key={c}>{c}</option>)}
+                  {ctxs.map(c=><option key={c}>{c}</option>)}
                 </select>
                 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
                   <div>
@@ -2220,7 +2499,7 @@
     }
 
     // ── ProcessModal ──────────────────────────────────────────────
-    function ProcessModal({ item, onMove, onMoveAsProject, onTrash, onClose }) {
+    function ProcessModal({ item, ctxs, onMove, onMoveAsProject, onTrash, onClose }) {
       const [due,       setDue]       = useState("");
       const [from,      setFrom]      = useState("");
       const [phase,     setPhase]     = useState("main"); // "main" | "project" | "doit"
@@ -2320,7 +2599,7 @@
                 style={{width:"100%",padding:"8px 10px",border:"1px solid #d1d5db",borderRadius:8,fontSize:13,outline:"none",marginBottom:8}}/>
               <select value={naCtx} onChange={e=>setNaCtx(e.target.value)}
                 style={{width:"100%",padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff",marginBottom:8}}>
-                {CONTEXTS.map(c=><option key={c}>{c}</option>)}
+                {ctxs.map(c=><option key={c}>{c}</option>)}
               </select>
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7,marginBottom:14}}>
                 <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Start (defer until)
@@ -2377,7 +2656,7 @@
                     style={{width:"100%",padding:"8px 10px",border:"1px solid #d1d5db",borderRadius:8,fontSize:13,outline:"none",marginBottom:8}}/>
                   <select value={naCtx} onChange={e=>setNaCtx(e.target.value)}
                     style={{width:"100%",padding:"7px 9px",border:"1px solid #d1d5db",borderRadius:7,fontSize:12,background:"#fff",marginBottom:8}}>
-                    {CONTEXTS.map(c=><option key={c}>{c}</option>)}
+                    {ctxs.map(c=><option key={c}>{c}</option>)}
                   </select>
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:7,marginBottom:14}}>
                     <label style={{display:"flex",flexDirection:"column",gap:2,fontSize:9,color:"#94a3b8",fontWeight:600}}>Start (defer until)
@@ -2450,8 +2729,10 @@
     }
 
     // ── DataModal: cloud sync + offline export / import ──────────
-    function DataModal({ counts, onExport, onImport, cloud, onClose }) {
+    function DataModal({ counts, archiveCount, contexts, onAddContext, onDelContext, onExport, onImport, cloud, onClose }) {
       const total   = LISTS.reduce((n,l)=>n+(counts[l]||0),0);
+      const [newCtx, setNewCtx] = useState("");
+      const fireAddCtx = () => { if(newCtx.trim()){ onAddContext(newCtx); setNewCtx(""); } };
       const overlay = {position:"fixed",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200};
       const box     = {background:"#fff",borderRadius:14,padding:22,width:420,maxWidth:"92vw",maxHeight:"92vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
       const card    = (bg,border,color) => ({padding:"11px 13px",background:bg,border:`1.5px solid ${border}`,borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:600,color,textAlign:"left",width:"100%"});
@@ -2463,7 +2744,7 @@
             <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>⇅ Sync &amp; Backup</div>
             <div style={{fontSize:12,color:"#64748b",marginBottom:14,lineHeight:1.5}}>
               Keep devices in sync via your own OneDrive, or move data manually with a file.
-              <strong> {total}</strong> item{total!==1?"s":""} on this device.
+              <strong> {total}</strong> item{total!==1?"s":""} on this device{archiveCount?` (+ ${archiveCount} archived)`:""}.
             </div>
 
             <div style={head}>Cloud sync — OneDrive</div>
@@ -2498,6 +2779,27 @@
                 </div>
               </div>
             )}
+
+            <div style={head}>Contexts</div>
+            <div style={{border:"1px solid #e2e8f0",borderRadius:8,padding:"11px 13px",marginBottom:16}}>
+              <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:8}}>
+                {(contexts||[]).map(c2=>(
+                  <span key={c2} className="chip" style={{display:"inline-flex",alignItems:"center",gap:5,cursor:"default"}}>
+                    {c2}
+                    {c2!=="@anywhere" && (
+                      <button onClick={()=>onDelContext(c2)} title={`Remove ${c2}`}
+                        style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:12,lineHeight:1,padding:0}}>×</button>
+                    )}
+                  </span>
+                ))}
+              </div>
+              <div style={{display:"flex",gap:6}}>
+                <input className="in in-sm" style={{flex:1}} value={newCtx} placeholder="@new-context"
+                  onChange={e=>setNewCtx(e.target.value)} onKeyDown={e=>e.key==="Enter"&&fireAddCtx()}/>
+                <button onClick={fireAddCtx} className="btn btn-pri btn-sm">Add</button>
+              </div>
+              <div style={{fontSize:10,color:"#94a3b8",marginTop:6}}>Contexts live in your data and sync everywhere. Removing one doesn't touch existing items.</div>
+            </div>
 
             <div style={head}>Export</div>
             <button onClick={onExport} style={{...card("#f5f3ff","#6366f1","#4338ca"),marginBottom:16}}>

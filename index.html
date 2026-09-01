@@ -113,7 +113,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v32";
+    const APP_VERSION = "v33";
 
     // Default contexts — seed only. Since schema v2 the live list is state.contexts,
     // editable in-app (Sync & Backup → Contexts); this constant is the fallback/seed.
@@ -579,13 +579,18 @@
       snapshot(state, todayISO, pnameOf) {
         const rows = todayRows(state, todayISO);
         return {
-          v: 1, at: Date.now(),
+          v: 2, at: Date.now(),
           counts: { inbox:   (state.inbox||[]).length,
+                    next:    (state.next||[]).length,
+                    waiting: (state.waiting||[]).length,
                     today:   rows.length,
                     overdue: rows.filter(r => r._kind === "overdue").length },
           rows: rows.slice(0, WIDGET_ROWS_MAX).map(i => ({
             id: String(i.id), title: (i.title||"").slice(0, 140), kind: i._kind, list: i._list,
             due: dueLabel(i.dueDate, i.dueTime), project: pnameOf(i) || "",
+            // only Next Actions carry today's focus star (same rule as TodayView)
+            canFocus: i._list === "next",
+            focused:  i._list === "next" && i.focusDate === todayISO,
           })),
         };
       },

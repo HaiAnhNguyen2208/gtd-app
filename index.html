@@ -113,7 +113,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v31";
+    const APP_VERSION = "v32";
 
     // Default contexts — seed only. Since schema v2 the live list is state.contexts,
     // editable in-app (Sync & Backup → Contexts); this constant is the fallback/seed.
@@ -513,6 +513,22 @@
       async push(d, retry = true) {
         if (!this.available() || !this.enabled() || !this.account()) return { ok: false };
         try {
+          // NEVER blind-write. No eTag means we have not read the remote in this
+          // session, so _putFile would send no If-Match and unconditionally clobber
+          // whatever is there — which is how a freshly installed device (empty
+          // localStorage, nothing pulled yet) can erase every other device's data.
+          // Read first, merge, then write. A read failure means we refuse to write.
+          if (!this._etag && retry) {
+            const remote = await this.pull();
+            if (!remote) return { ok: false };            // couldn't read → don't risk it
+            // Merge unconditionally, never branching on the eTag: when the file is
+            // absent pull() hands back a fresh() doc and the union is just `d`, so
+            // creating it still destroys nothing — and a file that exists but reports
+            // no eTag can't slip through into a blind overwrite.
+            const merged = mergeStates(d, remote.data);
+            const res    = await this.push(merged, false);
+            return res.ok ? { ok: true, merged } : { ok: false };
+          }
           const r = await this._putFile(GRAPH_ITEM, "_etag", d);
           if (r.status === 412 && retry) {
             const remote = await this.pull();              // refreshes this._etag
@@ -526,6 +542,14 @@
       async pushArchive(a, retry = true) {
         if (!this.available() || !this.enabled() || !this.account()) return { ok: false };
         try {
+          // same no-blind-write rule as push() — the archive is just as clobberable
+          if (!this._archEtag && retry) {
+            const remote = await this.pullArchive();
+            if (!remote) return { ok: false };
+            const merged = mergeArchive(a, remote.data);
+            const res    = await this.pushArchive(merged, false);
+            return res.ok ? { ok: true, merged } : { ok: false };
+          }
           const r = await this._putFile(GRAPH_ARCH, "_archEtag", a);
           if (r.status === 412 && retry) {
             const remote = await this.pullArchive();       // refreshes this._archEtag

@@ -113,7 +113,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v30";
+    const APP_VERSION = "v31";
 
     // Default contexts — seed only. Since schema v2 the live list is state.contexts,
     // editable in-app (Sync & Backup → Contexts); this constant is the fallback/seed.
@@ -164,18 +164,32 @@
     const isDeferred = (i, today) => i.startDate && i.startDate > today;
     const fresh   = () => ({ schemaVersion:SCHEMA_VERSION, inbox:[], next:[], projects:[], waiting:[], someday:[], reference:[], done:[],
                              contexts:[...CONTEXTS], tombstones:{}, _reviewedAt:0, _metaUpdatedAt:0, _updatedAt:0 });
-    // PWA share target: when the user shares text/a link from another app (Android/Win),
-    // the OS launches us at start_url with ?title/&text/&url. Read it once into a capture
-    // string and strip the query so a reload can't re-add it. Returns "" when not a share.
-    const readSharedCapture = () => {
+    // How we were launched. The OS/launcher starts us at start_url with a query:
+    // ?title/&text/&url from the PWA share target, or ?view/&capture/&float/&headless
+    // from a home-screen shortcut, the laptop float shortcut or the Android widget.
+    // ONE parser on purpose — reading is destructive (the query is stripped right after
+    // so a reload can't replay it), so two independent readers would starve each other.
+    //   capture      shared text to drop straight into the Inbox ("" = not a share)
+    //   view         nav key to open on boot ("" = default)
+    //   focusCapture autofocus the quick-capture box
+    //   float        pop the always-on-top Today window immediately
+    //   headless     offscreen sync run (Android worker) — skip UI-only work
+    const readLaunchIntent = () => {
+      const out = { capture:"", view:"", focusCapture:false, float:false, headless:false };
       try {
+        if (!location.search) return out;
         const p = new URLSearchParams(location.search);
         const parts = [];
         ["title","text","url"].forEach(k => { const v=(p.get(k)||"").trim(); if (v && !parts.includes(v)) parts.push(v); });
-        if (!parts.length) return "";
+        out.capture      = parts.join(" — ");
+        const v          = (p.get("view")||"").trim();
+        out.view         = NAV.includes(v) ? v : "";
+        out.focusCapture = p.get("capture")  === "1";
+        out.float        = p.get("float")    === "1";
+        out.headless     = p.get("headless") === "1";
         history.replaceState(null, "", location.pathname);
-        return parts.join(" — ");
-      } catch { return ""; }
+      } catch {}
+      return out;
     };
     // ═══ DATA CORE (schema v2) ═══════════════════════════════════
     // Pure data functions — no DOM, no network. tests/test_data_core.js extracts
@@ -327,6 +341,30 @@
       go.forEach(i => { tombs[i.id] = t; });
       return { state: { ...state, done: stay, tombstones: tombs, _updatedAt: t },
                archive: mergeArchive(archive, go) };
+    };
+
+    // Today = a derived cross-list view, never a stored list: the actionable items
+    // from TODAY_LISTS that want attention now, deduped by id with priority
+    // overdue > focus > due > started, ties broken by dueTime (timed appointments
+    // first). Each row carries `_list` (where it actually lives) and `_kind`.
+    // Shared by TodayView, FloatToday, the sidebar badge and the Android widget
+    // snapshot so the four can never drift apart.
+    const TODAY_RANK = { overdue:0, focus:1, due:2, started:3 };
+    const todayRows = (state, todayISO) => {
+      const seen = new Set(), rows = [];
+      TODAY_LISTS.forEach(l => (state[l]||[]).forEach(i => {
+        if (seen.has(i.id) || isDeferred(i, todayISO)) return;   // tickler: not actionable yet
+        const od    = !!(i.dueDate && i.dueDate < todayISO);
+        const due   = i.dueDate === todayISO;
+        const foc   = l === "next" && i.focusDate === todayISO;
+        // tickler fired: its start date has arrived — surface it as on-deck
+        const start = !!(i.startDate && i.startDate <= todayISO);
+        if (!(od || due || foc || start)) return;
+        seen.add(i.id);
+        rows.push({ ...i, _list:l, _kind: od ? "overdue" : foc ? "focus" : due ? "due" : "started" });
+      }));
+      return rows.sort((a, b) => (TODAY_RANK[a._kind] - TODAY_RANK[b._kind])
+                              || ((a.dueTime||"24:00").localeCompare(b.dueTime||"24:00")));
     };
     // ═══ END DATA CORE ═══════════════════════════════════════════
 
@@ -500,6 +538,47 @@
       },
     };
 
+    // ── Android home-screen widget bridge ────────────────────────
+    // Present only inside the Android wrapper APK (see android/), which injects an
+    // `AndroidWidget` object into the WebView. The widget runs in a different process
+    // and cannot read this WebView's localStorage, so the contract is asymmetric:
+    //   • we PUBLISH a small read-only snapshot of Today after every state change;
+    //   • the widget ENQUEUES intents (complete / capture / focus) which we drain and
+    //     apply through the normal mutation path.
+    // Kotlin never mutates GTD state — stamping, item-level merge, tombstones and
+    // OneDrive sync all stay here, in one place. No-ops in a normal browser.
+    const WIDGET_ROWS_MAX = 25;
+    const WidgetBridge = {
+      available: () => typeof AndroidWidget !== "undefined" && AndroidWidget !== null,
+      // ids are floats (Date.now()+Math.random()) — stringify them so Kotlin can round-trip
+      // them without losing precision, and compare as strings on the way back.
+      snapshot(state, todayISO, pnameOf) {
+        const rows = todayRows(state, todayISO);
+        return {
+          v: 1, at: Date.now(),
+          counts: { inbox:   (state.inbox||[]).length,
+                    today:   rows.length,
+                    overdue: rows.filter(r => r._kind === "overdue").length },
+          rows: rows.slice(0, WIDGET_ROWS_MAX).map(i => ({
+            id: String(i.id), title: (i.title||"").slice(0, 140), kind: i._kind, list: i._list,
+            due: dueLabel(i.dueDate, i.dueTime), project: pnameOf(i) || "",
+          })),
+        };
+      },
+      publish(state, todayISO, pnameOf) {
+        if (!this.available()) return;
+        try { AndroidWidget.publish(JSON.stringify(this.snapshot(state, todayISO, pnameOf))); } catch {}
+      },
+      // → [{op:"complete"|"capture"|"focus", id?, text?}]; the Kotlin side clears the queue
+      drain() {
+        if (!this.available()) return [];
+        try { const a = JSON.parse(AndroidWidget.takePending() || "[]"); return Array.isArray(a) ? a : []; }
+        catch { return []; }
+      },
+      // lets HeadlessSyncWorker tear its offscreen WebView down as soon as we're synced
+      ready() { if (this.available()) { try { AndroidWidget.notifyReady(); } catch {} } },
+    };
+
     // ── Data portability: export / import a JSON backup ──────────
     // Offline, server-free way to move data between devices and to back it up.
     // Export → a downloadable (or shareable, on mobile) gtd-backup-*.json file
@@ -546,9 +625,13 @@
     };
 
     // ── App ───────────────────────────────────────────────────────
+    // Read once at load, before the first render: the parse strips the query string,
+    // so calling it from a component (which React may render twice) would lose it.
+    const LAUNCH = readLaunchIntent();
+
     function App() {
       const [items, setItems]             = useState(null);
-      const [active, setActive]           = useState("today");
+      const [active, setActive]           = useState(LAUNCH.view || "today");
       const [ctx, setCtx]                 = useState("all");
       const [capture, setCapture]         = useState("");
       const [showForm, setShowForm]       = useState(false);
@@ -588,6 +671,16 @@
 
       // keep a ref of the latest items for async sync callbacks (avoids stale closures)
       useEffect(() => { itemsRef.current = items; }, [items]);
+
+      // mirror a compact Today snapshot out to the Android home-screen widget on every
+      // change (no-op in a normal browser). Self-contained so it can sit above the
+      // `if (!items)` early return, where the App's own pnameOf isn't in scope yet.
+      useEffect(() => {
+        if (!items || !WidgetBridge.available()) return;
+        const pm = projIndex(items);
+        WidgetBridge.publish(items, isoDate(new Date()),
+                             i => (i && i.projectId && pm.get(i.projectId)) || null);
+      }, [items]);
 
       // a freshly deployed build took control (see the SW registration script) → prompt to reload
       useEffect(() => {
@@ -655,7 +748,7 @@
       //    then run a full reconcile against the optional remotes. ──
       useEffect(() => {
         const local  = Store.loadLocal() || fresh();
-        const shared = readSharedCapture();   // PWA "share to GTD" → straight into the Inbox
+        const shared = LAUNCH.capture;        // PWA "share to GTD" → straight into the Inbox
         const seeded = shared ? stampChanges(local, { ...local, inbox:[mk(shared), ...local.inbox] }) : local;
         itemsRef.current = seeded; setItems(seeded); Store.saveLocal(seeded);
         archiveRef.current = Store.loadArchive(); setArchiveState(archiveRef.current);
@@ -715,6 +808,11 @@
           alert("The Microsoft sign-in library couldn't load (network or content blocker). Check your connection and reload, then try again.");
           return;
         }
+        // Android wrapper: a WebView has no popup surface, so skip loginPopup entirely
+        // and use the full-page redirect (the effect above finishes it on the way back).
+        if (WidgetBridge.available()) {
+          try { Drive.init(); Drive._msal.loginRedirect({ scopes: MS_SCOPES }); return; } catch {}
+        }
         try {
           const a = await Drive.connect();
           setOdAccount(a);
@@ -742,6 +840,68 @@
         setItems(stamped);
         persist(stamped);
       }, [items, persist]);
+
+      // ── Android widget → app: apply whatever the home screen queued ──────────
+      // The whole batch goes in as ONE state transition: calling confirmComplete /
+      // toggleFocus per op would race on their stale `items` closure. Stamps and sets
+      // itemsRef synchronously (not via the [items] effect) because the headless run
+      // below immediately hands the result to fullSync/Drive.push.
+      const drainWidgetOps = useCallback(() => {
+        const ops = WidgetBridge.drain();
+        if (!ops.length) return null;
+        const cur = itemsRef.current || fresh();
+        const now = ts(), day = isoDate(new Date());
+        let n = cur;
+        ops.forEach(op => {
+          const id = op && op.id != null ? String(op.id) : "";
+          if (op.op === "capture" && (op.text||"").trim()) {
+            n = { ...n, inbox:[mk(op.text), ...n.inbox] };
+          } else if (op.op === "complete" && id) {
+            TODAY_LISTS.forEach(l => {
+              const it = (n[l]||[]).find(i => String(i.id) === id);
+              if (!it) return;
+              n = { ...n, [l]: n[l].filter(i => String(i.id) !== id), done:[{...it, doneAt:now}, ...n.done] };
+            });
+          } else if (op.op === "focus" && id) {
+            n = { ...n, next: (n.next||[]).map(i => String(i.id) === id
+              ? { ...i, focusDate: i.focusDate === day ? "" : day } : i) };
+          }
+        });
+        if (n === cur) return null;
+        const stamped = stampChanges(cur, n);
+        itemsRef.current = stamped;
+        setHistory(h => [...h.slice(-19), cur]);   // Ctrl+Z still undoes a widget action
+        setItems(stamped);
+        persist(stamped);
+        return stamped;
+      }, [persist]);
+
+      // drain on load and whenever we come back to the foreground (the usual case:
+      // you ticked something on the home screen, then opened the app)
+      useEffect(() => {
+        if (!WidgetBridge.available()) return;
+        drainWidgetOps();
+        const onVis = () => { if (document.visibilityState === "visible") drainWidgetOps(); };
+        document.addEventListener("visibilitychange", onVis);
+        return () => document.removeEventListener("visibilitychange", onVis);
+      }, [drainWidgetOps]);
+
+      // Offscreen sync run: HeadlessSyncWorker loads us with ?headless=1 right after a
+      // widget action. Apply the queue, reconcile, force the OneDrive push past the 2s
+      // debounce (the WebView is destroyed the moment we report ready), then release it.
+      const headlessRef = React.useRef(false);
+      useEffect(() => {
+        if (!LAUNCH.headless || !items || headlessRef.current || !WidgetBridge.available()) return;
+        headlessRef.current = true;
+        (async () => {
+          try {
+            drainWidgetOps();
+            await fullSyncRef.current();
+            if (Drive.enabled()) await Drive.push(itemsRef.current);
+          } catch {}
+          WidgetBridge.ready();
+        })();
+      }, [items, drainWidgetOps]);
 
       const undo = useCallback(() => {
         if (history.length === 0) return;
@@ -931,9 +1091,39 @@
         );
       }, [pipOn, items]);
 
+      // `?float=1` — the laptop widget shortcut. Document-PiP requires a user gesture,
+      // so the automatic attempt is usually refused; when it is we fall back to a bare
+      // launcher screen: one click and the floating window is up.
+      const [floatWanted, setFloatWanted] = useState(LAUNCH.float && pipSupported);
+      const floatTriedRef = React.useRef(false);
+      React.useEffect(() => {
+        if (!floatWanted || pipOn || floatTriedRef.current || !items) return;
+        floatTriedRef.current = true;
+        openPip();
+      }, [floatWanted, pipOn, items]);
+      React.useEffect(() => { if (pipOn) setFloatWanted(false); }, [pipOn]);
+
+      // `?capture=1` — home-screen "quick capture" shortcut lands with the box focused
+      const captureRef = React.useRef(null);
+      React.useEffect(() => {
+        if (!LAUNCH.focusCapture) return;
+        const t = setTimeout(() => { try { captureRef.current && captureRef.current.focus(); } catch(e){} }, 60);
+        return () => clearTimeout(t);
+      }, []);
+
       if (!items) return (
         <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",color:"#64748b",fontSize:14}}>
           Loading…
+        </div>
+      );
+
+      // launcher stub for the `?float=1` shortcut (see above) — supplies the click that
+      // Document-PiP demands, then gets out of the way once the float is open.
+      if (floatWanted) return (
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:12,height:"100vh"}}>
+          <div style={{fontSize:34}}>🎯</div>
+          <button onClick={openPip} className="btn btn-pri">⤢ Open floating Today</button>
+          <button onClick={()=>setFloatWanted(false)} className="btn btn-ghost btn-sm">Open the full app instead</button>
         </div>
       );
 
@@ -954,17 +1144,9 @@
       const deferredShown = canDefer
         ? shown.filter(i=>isDeferred(i,todayISO)).sort((a,b)=>a.startDate.localeCompare(b.startDate))
         : [];
-      const todayFocus = (() => {
-        const seen=new Set(); let count=0, overdue=false;
-        TODAY_LISTS.forEach(l=>(items[l]||[]).forEach(i=>{
-          if (isDeferred(i,todayISO)) return;   // tickler: not actionable yet
-          const od  = i.dueDate && i.dueDate < todayISO;
-          const due = i.dueDate === todayISO;
-          const foc = l==="next" && i.focusDate === todayISO;
-          if ((od||due||foc) && !seen.has(i.id)) { seen.add(i.id); count++; if (od) overdue=true; }
-        }));
-        return { count, overdue };
-      })();
+      // sidebar badge — same derivation as the Today view, so the two always agree
+      const todayList  = todayRows(items, todayISO);
+      const todayFocus = { count: todayList.length, overdue: todayList.some(r=>r._kind==="overdue") };
       // Project link helpers (id-based since schema v2)
       const pmap    = projIndex(items);                                            // id → project title
       const pnameOf = i => (i && i.projectId && pmap.get(i.projectId)) || null;    // for chips/grouping
@@ -1015,7 +1197,7 @@
             <div style={{padding:"10px 12px",borderBottom:"1px solid rgba(255,255,255,.06)"}}>
               <div style={{fontSize:9,color:"#475569",textTransform:"uppercase",letterSpacing:"1px",marginBottom:5}}>Quick Capture</div>
               <div style={{display:"flex",gap:5}}>
-                <input value={capture} onChange={e=>setCapture(e.target.value)}
+                <input ref={captureRef} value={capture} onChange={e=>setCapture(e.target.value)}
                   onKeyDown={e=>e.key==="Enter"&&quickCapture()} placeholder="Capture a thought…"
                   style={{flex:1,padding:"6px 8px",background:"rgba(255,255,255,.07)",border:"1px solid rgba(255,255,255,.1)",borderRadius:6,color:"#f1f5f9",fontSize:11,outline:"none"}}/>
                 <button onClick={quickCapture}
@@ -1709,20 +1891,13 @@
       const dateLabel = new Date(todayISO+"T00:00").toLocaleDateString("en-US",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
       const [hideReview, setHideReview] = useState(false);
 
-      // classify, deduped by id with priority overdue > focus > due > started
-      const seen=new Set(), overdue=[], focus=[], due=[], started=[];
-      TODAY_LISTS.forEach(l=>(items[l]||[]).forEach(i=>{
-        if (seen.has(i.id)) return;
-        if (isDeferred(i,todayISO)) return;   // tickler: actions deferred to a FUTURE day aren't "today"
-        const it={...i,_list:l};
-        if (i.dueDate && i.dueDate < todayISO)        { overdue.push(it); seen.add(i.id); }
-        else if (l==="next" && i.focusDate===todayISO){ focus.push(it);   seen.add(i.id); }
-        else if (i.dueDate===todayISO)                { due.push(it);     seen.add(i.id); }
-        // tickler fired: its start date has arrived (today or earlier) — surface it as on-deck
-        else if (i.startDate && i.startDate<=todayISO){ started.push(it); seen.add(i.id); }
-      }));
-      due.sort((a,b)=>(a.dueTime||"24:00").localeCompare(b.dueTime||"24:00"));   // timed appointments first
-      const total = overdue.length + focus.length + due.length + started.length;
+      // classify, deduped by id with priority overdue > focus > due > started (DATA CORE)
+      const rows    = todayRows(items, todayISO);
+      const overdue = rows.filter(r=>r._kind==="overdue");
+      const focus   = rows.filter(r=>r._kind==="focus");
+      const due     = rows.filter(r=>r._kind==="due");
+      const started = rows.filter(r=>r._kind==="started");
+      const total   = rows.length;
 
       const Row = ({ i, ov }) => {
         const pname = pnameOf(i);
@@ -1827,16 +2002,8 @@
       const [text, setText] = useState("");
       const fire = () => { const t=text.trim(); if(!t) return; onCapture(t); setText(""); };
 
-      // same Today classification as TodayView, flattened + ranked into one list
-      const seen=new Set(), rows=[];
-      TODAY_LISTS.forEach(l=>(items[l]||[]).forEach(i=>{
-        if (seen.has(i.id) || isDeferred(i,todayISO)) return;
-        const od=i.dueDate&&i.dueDate<todayISO, due=i.dueDate===todayISO,
-              foc=l==="next"&&i.focusDate===todayISO, start=i.startDate&&i.startDate<=todayISO&&!due&&!od;
-        if (od||due||foc||start){ seen.add(i.id); rows.push({...i,_list:l,_kind:od?"overdue":foc?"focus":due?"due":"started"}); }
-      }));
-      const rank={overdue:0,focus:1,due:2,started:3};
-      rows.sort((a,b)=>(rank[a._kind]-rank[b._kind])||((a.dueTime||"24:00").localeCompare(b.dueTime||"24:00")));
+      // same Today classification as TodayView, flattened + ranked into one list (DATA CORE)
+      const rows  = todayRows(items, todayISO);
       const inbox = items.inbox||[];
       const kindMeta = { overdue:["⚠️","#b91c1c","#fff7f7","#fca5a5"], focus:["🎯","#7c3aed","#fff","#e2e8f0"],
                          due:["📅","#166534","#fff","#e2e8f0"], started:["🚀","#1d4ed8","#fff","#e2e8f0"] };

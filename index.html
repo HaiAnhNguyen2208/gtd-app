@@ -992,6 +992,43 @@
       },
     };
 
+    // Structured outputs support only a SUBSET of JSON Schema: no maxItems, maxLength,
+    // pattern, minimum/maximum or oneOf, and additionalProperties must be false. A cap
+    // therefore lives in `description` (advisory) and in applyAiOps' AI_OPS_MAX (binding).
+    // Hoisted to module level so a test can assert no unsupported keyword creeps back in.
+    const AI_SCHEMAS = {
+      clarify: {
+        type:"object", additionalProperties:false, required:["actionable","reasoning","ops"],
+        properties: {
+          actionable: { type:"boolean" },
+          reasoning:  { type:"string", description:"One short sentence, shown to the user." },
+          ops:        { type:"array", items: AI_OP_SCHEMA, description:"At most 6 ops." },
+        },
+      },
+      breakdown: {
+        type:"object", additionalProperties:false, required:["outcome","nextAction","ops"],
+        properties: {
+          outcome:    { type:"string", description:"What 'done' looks like, in one sentence." },
+          nextAction: { type:"string", description:"The single very next physical action." },
+          ops:        { type:"array", items: AI_OP_SCHEMA, description:"At most 12 ops." },
+        },
+      },
+      review: {
+        type:"object", additionalProperties:false, required:["headline","observations","ops"],
+        properties: {
+          headline: { type:"string", description:"One sentence on the health of the system." },
+          observations: { type:"array", description:"At most 6 observations.", items: {
+            type:"object", additionalProperties:false, required:["phase","text"],
+            properties: {
+              phase: { type:"string", enum:["clear","current","creative"] },
+              text:  { type:"string" },
+              refs:  { type:"array", items:{ type:"string" } },
+            } } },
+          ops: { type:"array", items: AI_OP_SCHEMA, description:"At most 20 ops." },
+        },
+      },
+    };
+
     // Frozen across calls of the same task — this is the only part worth caching.
     const AI_GTD_RULES = [
       "You are a Getting Things Done (GTD) assistant embedded in the user's own trusted system.",
@@ -1037,13 +1074,7 @@
         const r = await Ai.structured({
           model: AI_MODEL, max_tokens: 2000,
           thinking: { type:"adaptive" },
-          output_config: { effort:"low", format: { type:"json_schema", schema: {
-            type:"object", additionalProperties:false, required:["actionable","reasoning","ops"],
-            properties: {
-              actionable: { type:"boolean" },
-              reasoning:  { type:"string", description:"One short sentence, shown to the user." },
-              ops:        { type:"array", maxItems:6, items: AI_OP_SCHEMA },
-            } } } },
+          output_config: { effort:"low", format: { type:"json_schema", schema: AI_SCHEMAS.clarify } },
           system: aiSys(rules, aiCtxLine(state) + "\n\nExisting projects:\n" + (p.text || "(none)"), true),
           messages: [{ role:"user", content:
             `Today is ${todayISO}.\nThe captured item is alias ${o.ref}: "${(item.title||"").trim()}"` }],
@@ -1066,13 +1097,7 @@
         const r = await Ai.structured({
           model: AI_MODEL, max_tokens: 3000,
           thinking: { type:"adaptive" },
-          output_config: { effort:"medium", format: { type:"json_schema", schema: {
-            type:"object", additionalProperties:false, required:["outcome","nextAction","ops"],
-            properties: {
-              outcome:    { type:"string", description:"What 'done' looks like, in one sentence." },
-              nextAction: { type:"string", description:"The single very next physical action." },
-              ops:        { type:"array", maxItems:12, items: AI_OP_SCHEMA },
-            } } } },
+          output_config: { effort:"medium", format: { type:"json_schema", schema: AI_SCHEMAS.breakdown } },
           system: aiSys(rules, aiCtxLine(state), false),
           messages: [{ role:"user", content:
             `Today is ${todayISO}.\nProject alias p1: "${(proj.title||"").trim()}"` +
@@ -1098,19 +1123,7 @@
         const r = await Ai.structured({
           model: AI_MODEL, max_tokens: 8000,
           thinking: { type:"adaptive", display:"summarized" },
-          output_config: { effort:"high", format: { type:"json_schema", schema: {
-            type:"object", additionalProperties:false, required:["headline","observations","ops"],
-            properties: {
-              headline: { type:"string", description:"One sentence on the health of the system." },
-              observations: { type:"array", maxItems:6, items: {
-                type:"object", additionalProperties:false, required:["phase","text"],
-                properties: {
-                  phase: { type:"string", enum:["clear","current","creative"] },
-                  text:  { type:"string" },
-                  refs:  { type:"array", items:{ type:"string" } },
-                } } },
-              ops: { type:"array", maxItems:20, items: AI_OP_SCHEMA },
-            } } } },
+          output_config: { effort:"high", format: { type:"json_schema", schema: AI_SCHEMAS.review } },
           system: aiSys(rules, aiCtxLine(state) + "\n\n" + p.text, false),
           messages: [{ role:"user", content: `Today is ${todayISO}.\n\nCounts the app computed:\n${facts}` }],
         }, { timeout: 180000, ...(o||{}) });

@@ -113,7 +113,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v35";
+    const APP_VERSION = "v36";
 
     // Default contexts — seed only. Since schema v2 the live list is state.contexts,
     // editable in-app (Sync & Backup → Contexts); this constant is the fallback/seed.
@@ -826,7 +826,7 @@
     const AI_URL     = "https://api.anthropic.com/v1/messages";
     const AI_MODEL   = "claude-opus-5";
     const AI_VERSION = "2023-06-01";
-    const AI_TIMEOUT = 90000;
+    const AI_TIMEOUT = 60000;   // small structured calls; the review coach passes its own
 
     const Ai = {
       key()     { try { return localStorage.getItem(AI_KEY_LS) || ""; } catch { return ""; } },
@@ -3237,14 +3237,28 @@
     };
     function AiOpsReview({ ops, results, notes, busy, error, onApply, onRetry, onCancel, applyLabel }) {
       const [off, setOff] = useState({});
+      const [secs, setSecs] = useState(0);
       useEffect(() => { setOff({}); }, [results]);          // a fresh run starts fully ticked
+      // A silent spinner makes "it's slow" and "it's wedged" look identical. Count.
+      useEffect(() => {
+        if (!busy) { setSecs(0); return; }
+        const t = setInterval(() => setSecs(n => n + 1), 1000);
+        return () => clearInterval(t);
+      }, [busy]);
       const rows    = results || [];
       const chosen  = rows.filter(r => r.ok && !off[r.i]).map(r => r.i);
       const box     = {border:"1px solid #ddd6fe",background:"#faf5ff",borderRadius:9,padding:"11px 13px",marginBottom:10};
 
       if (busy) return (
         <div style={box}>
-          <div style={{fontSize:12,color:"#5b21b6",fontWeight:600}}>✨ Asking Claude…</div>
+          <div style={{fontSize:12,color:"#5b21b6",fontWeight:600}}>
+            ✨ Asking Claude… {secs > 2 ? `${secs}s` : ""}
+          </div>
+          {secs > 20 && (
+            <div style={{fontSize:10,color:"#8b5cf6",marginTop:4,lineHeight:1.5}}>
+              Longer than usual. It gives up at 60s — check DevTools → Network → “messages” if this repeats.
+            </div>
+          )}
           {onCancel && <button onClick={onCancel} className="btn btn-ghost btn-sm" style={{marginTop:8}}>Cancel</button>}
         </div>
       );

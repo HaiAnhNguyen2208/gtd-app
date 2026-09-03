@@ -5,7 +5,7 @@
  * never intercepted — they hit the network when a server is reachable and are
  * simply allowed to fail offline (the app falls back to localStorage). */
 
-const CACHE = "gtd-v33";
+const CACHE = "gtd-v34";
 
 const SHELL = [
   "./",
@@ -43,8 +43,11 @@ self.addEventListener("fetch", (e) => {
 
   const url = new URL(req.url);
   if (url.pathname.endsWith("/api/state") || url.pathname.endsWith("/api/archive") || url.pathname.endsWith("/api/ping")) return;
-  // OneDrive auth + data must always hit the network — never cache or intercept.
-  if (url.hostname === "graph.microsoft.com" || url.hostname === "login.microsoftonline.com") return;
+  // OneDrive auth + data, and the Anthropic API, must always hit the network —
+  // never cache or intercept. (Claude calls are POST, so the guard above already lets
+  // them through; this keeps the intent explicit and covers any future GET.)
+  if (url.hostname === "graph.microsoft.com" || url.hostname === "login.microsoftonline.com"
+      || url.hostname === "api.anthropic.com") return;
 
   if (req.mode === "navigate") {                          // app shell: network, fall back to cached page
     e.respondWith((async () => {

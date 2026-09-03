@@ -113,7 +113,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v33";
+    const APP_VERSION = "v34";
 
     // Default contexts — seed only. Since schema v2 the live list is state.contexts,
     // editable in-app (Sync & Backup → Contexts); this constant is the fallback/seed.
@@ -127,7 +127,7 @@
     // Inbox → the organize lists → Calendar/Weekly Review (reflect) → Done. Today leads
     // as the daily home. `today`/`calendar`/`review` are cross-list views, not stored
     // lists, so they stay out of LISTS to keep data/count logic untouched.
-    const NAV      = ["today","inbox","next","waiting","projects","someday","reference","calendar","review","done"];
+    const NAV      = ["today","inbox","next","waiting","projects","someday","reference","calendar","review","chat","done"];
     // Lists whose items can carry a dueDate and so appear on the Calendar.
     const DATED    = ["next","waiting","projects","someday"];
     // Lists the Today view draws from — actionable work only. Projects are outcomes
@@ -144,6 +144,7 @@
       waiting:   { icon:"⏳", label:"Waiting For",    hint:"Delegated to or expected from others" },
       someday:   { icon:"🌟", label:"Someday/Maybe",  hint:"Ideas to revisit when the time is right" },
       reference: { icon:"📁", label:"Reference",      hint:"Non-actionable — keep for future lookup" },
+      chat:      { icon:"✨", label:"Ask Claude",     hint:"Question your own system — read-only" },
       done:      { icon:"✅", label:"Done",           hint:"Completed items" },
     };
 
@@ -365,6 +366,211 @@
       }));
       return rows.sort((a, b) => (TODAY_RANK[a._kind] - TODAY_RANK[b._kind])
                               || ((a.dueTime||"24:00").localeCompare(b.dueTime||"24:00")));
+    };
+
+    // ── AI ops ────────────────────────────────────────────────────
+    // Claude never sees a real item id (they're floats — costly to serialize, easy to
+    // mangle) and never mutates anything itself. aiProjection mints short aliases
+    // (n3, p1, w2) and hands back the alias→id map; the model proposes ops against
+    // those aliases; applyAiOps resolves them and folds the whole batch into ONE plain
+    // next state. Stamping stays with `upd` — same division of labour as drainWidgetOps.
+    const AI_OPS       = ["add","update","move","link","focus","complete","trash"];
+    const AI_OPS_MAX   = 40;                                 // a runaway model may not rewrite the system
+    const AI_ADD_LISTS = LISTS.filter(l => l !== "done");    // reaching done is `complete`, not `add`
+    const AI_PATCH     = ["title","context","dueDate","dueTime","startDate","waitingFor","energy","time"];
+    const AI_LETTER    = { inbox:"i", next:"n", projects:"p", waiting:"w", someday:"s", reference:"r", done:"d" };
+    const aiIsDate     = v => /^\d{4}-\d{2}-\d{2}$/.test(String(v||""));
+    const aiIsTime     = v => /^\d{2}:\d{2}$/.test(String(v||""));
+
+    // The one rendering of state for a prompt, and the one alias scheme. Line-oriented
+    // (≈40% fewer tokens than JSON for the same fields); empty fields are omitted.
+    // No raw item id ever appears in `text` — that is the point, and it is asserted.
+    //   opts = { lists?, max?, doneDays?, fields?:"title" }
+    const aiProjection = (state, todayISO, opts) => {
+      const o     = opts || {};
+      const lists = Array.isArray(o.lists) && o.lists.length ? o.lists : ["inbox","next","waiting","projects","someday"];
+      const max   = o.max > 0 ? o.max : 120;
+      const brief = o.fields === "title";
+      const names = projIndex(state);
+      const refs = {}, counts = {}, out = [];
+      let truncated = false;
+      const src = {};
+      lists.forEach(l => {
+        let all = state[l] || [];
+        if (l === "done" && o.doneDays > 0) {
+          const cut = Date.now() - o.doneDays * 86400000;
+          all = all.filter(i => i.doneAt && new Date(i.doneAt).getTime() >= cut);
+        }
+        counts[l] = all.length;
+        if (all.length > max) truncated = true;
+        src[l] = all.slice(0, max);
+      });
+      // alias every shown item first, so a linked action can point at its project's alias
+      const alias = new Map();
+      lists.forEach(l => src[l].forEach((i, k) => { if (!alias.has(i.id)) alias.set(i.id, (AI_LETTER[l]||"x") + (k+1)); }));
+      lists.forEach(l => {
+        if (!src[l].length) return;
+        out.push("## " + l + (counts[l] > src[l].length ? ` (showing ${src[l].length} of ${counts[l]})` : ""));
+        src[l].forEach((i, k) => {
+          const a = (AI_LETTER[l]||"x") + (k+1);
+          refs[a] = i.id;
+          const f = [a, (i.title||"").trim()];
+          if (!brief) {
+            if (i.context && i.context !== "@anywhere") f.push(i.context);
+            if (i.dueDate)    f.push("due " + i.dueDate + (i.dueTime ? " " + i.dueTime : ""));
+            if (i.startDate)  f.push("start " + i.startDate);
+            if (i.waitingFor) f.push("for:" + i.waitingFor);
+            if (todayISO && i.focusDate === todayISO) f.push("focus");
+            if (i.projectId)  f.push("proj " + (alias.get(i.projectId) || names.get(i.projectId) || "?"));
+            const et = [i.energy ? "E:"+i.energy : "", i.time ? "T:"+i.time : ""].filter(Boolean).join(" ");
+            if (et) f.push(et);
+          }
+          out.push(f.join(" | "));
+        });
+      });
+      return { refs, text: out.join("\n"), counts, truncated };
+    };
+
+    // Fold a batch of model-proposed ops into ONE plain next state. Unknown or
+    // unapplicable ops are SKIPPED with a reason — nothing throws, so a half-wrong
+    // batch still applies its good half. A batch that changes nothing returns the
+    // input state BY REFERENCE, so the caller can skip upd (the `n === cur` idiom).
+    //   opts = { refs:{alias:id}, todayISO }
+    // → { state, results:[{i, op, ok, reason?, effect?, clamped}], applied, skipped }
+    const applyAiOps = (state, ops, opts) => {
+      const o       = opts || {};
+      const today   = o.todayISO || "";
+      const refs    = { ...(o.refs || {}) };       // working map — `as` registers new items
+      const results = [];
+      if (!Array.isArray(ops)) return { state, results, applied:0, skipped:0 };
+      let n = state;
+
+      const ctxOf = raw => {
+        const list = Array.isArray(state.contexts) && state.contexts.length ? state.contexts : CONTEXTS;
+        const key  = String(raw||"").trim().toLowerCase();
+        return list.find(c => String(c).toLowerCase() === key) || "";
+      };
+      // alias first, then a raw-id string match — the same string comparison the
+      // Kotlin widget bridge uses, because ids cross both boundaries as strings.
+      const find = ref => {
+        const key = String(ref == null ? "" : ref);
+        if (!key) return null;
+        const id  = refs[key];
+        for (const l of LISTS) {
+          const arr = n[l] || [];
+          const k = id !== undefined ? arr.findIndex(x => x.id === id)
+                                     : arr.findIndex(x => String(x.id) === key);
+          if (k >= 0) return { list:l, idx:k, item:arr[k] };
+        }
+        return null;
+      };
+      const projOf = (raw, clamped) => {
+        if (raw === "" || raw == null) return "";                      // explicit unlink
+        const hit = find(raw);
+        if (hit && (hit.list === "projects" || hit.list === "someday")) return hit.item.id;
+        const key = String(raw).trim().toLowerCase();
+        const m   = ["projects","someday"].reduce((a,l) => a.concat(n[l]||[]), [])
+                      .find(x => (x.title||"").trim().toLowerCase() === key);
+        if (m) return m.id;
+        clamped.push("project");
+        return null;                                                   // unresolved is not the same as unlink
+      };
+      // Copy whitelisted fields across, dropping anything malformed instead of
+      // rejecting the whole op — a bad date should not cost you a good action.
+      const patch = (src, into, clamped) => {
+        AI_PATCH.forEach(f => {
+          if (!(f in src)) return;
+          let v = src[f];
+          if (f === "title")        { v = String(v||"").trim().slice(0,200); if (!v) return; }
+          else if (f === "context") { const c = ctxOf(v); if (!c) { clamped.push("context"); return; } v = c; }
+          else if (f === "dueDate" || f === "startDate") { v = String(v||""); if (v && !aiIsDate(v)) { clamped.push(f); return; } }
+          else if (f === "dueTime") { v = String(v||""); if (v && !aiIsTime(v)) { clamped.push(f); return; } }
+          else if (f === "energy")  { v = String(v||""); if (v && ENERGIES.indexOf(v) < 0) { clamped.push(f); return; } }
+          else if (f === "time")    { v = String(v||""); if (v && TIMES.indexOf(v) < 0)    { clamped.push(f); return; } }
+          else v = String(v||"");
+          into[f] = v;
+        });
+        if (!into.dueDate) into.dueTime = "";     // a bare time is meaningless (mirrors the add form)
+      };
+      const put  = (list, idx, item) => { const a = [...(n[list]||[])]; a[idx] = item; n = { ...n, [list]: a }; };
+      const pull = (list, idx)       => { n = { ...n, [list]: (n[list]||[]).filter((_,k) => k !== idx) }; };
+
+      ops.forEach((op, i) => {
+        const clamped = [];
+        const skip = reason => { results.push({ i, op:(op && op.op) || "", ok:false, reason, clamped }); };
+        const done = effect => { results.push({ i, op:op.op, ok:true, effect, clamped }); };
+        if (i >= AI_OPS_MAX)                              return skip("too-many");
+        if (!op || typeof op !== "object" || typeof op.op !== "string") return skip("bad-shape");
+        if (AI_OPS.indexOf(op.op) < 0)                    return skip("unknown-op");
+
+        if (op.op === "add") {
+          const list = AI_ADD_LISTS.indexOf(String(op.list||"")) >= 0 ? String(op.list) : "";
+          if (!list) return skip("no-such-list");
+          const title = String(op.title||"").trim().slice(0,200);
+          if (!title) return skip("empty-title");
+          const it = mk(title);
+          patch(op, it, clamped);
+          it.title = title;
+          if ("project" in op) { const p = projOf(op.project, clamped); it.projectId = p == null ? "" : p; }
+          n = { ...n, [list]: [it, ...(n[list]||[])] };
+          if (op.as) refs[String(op.as)] = it.id;          // later ops in this batch can reference it
+          return done(`add → ${list}: ${title}`);
+        }
+
+        const hit = find(op.ref);
+        if (!hit) return skip("no-such-item");
+        const was = hit.item, name = (was.title||"").trim();
+
+        if (op.op === "trash") {
+          pull(hit.list, hit.idx);
+          n = { ...n, tombstones: { ...n.tombstones, [was.id]: Date.now() } };   // or it resurrects from a peer
+          return done(`trash: ${name}`);
+        }
+        if (op.op === "complete") {
+          if (hit.list === "done") return skip("noop");
+          pull(hit.list, hit.idx);
+          n = { ...n, done: [{ ...was, doneAt: ts() }, ...(n.done||[])] };
+          return done(`complete: ${name}`);
+        }
+        if (op.op === "focus") {
+          if (hit.list !== "next") return skip("wrong-list");
+          const want = op.on === false ? "" : today;
+          if ((was.focusDate||"") === want) return skip("noop");
+          put(hit.list, hit.idx, { ...was, focusDate: want });
+          return done(want ? `focus today: ${name}` : `unfocus: ${name}`);
+        }
+        if (op.op === "link") {
+          const p = projOf(op.project, clamped);
+          if (p == null) return skip("no-such-project");
+          if ((was.projectId||"") === (p||"")) return skip("noop");
+          put(hit.list, hit.idx, { ...was, projectId: p });
+          return done(p ? `link: ${name} → ${projIndex(n).get(p) || "project"}` : `unlink: ${name}`);
+        }
+
+        const next = { ...was };
+        patch(op, next, clamped);
+        if ("project" in op) { const p = projOf(op.project, clamped); if (p != null) next.projectId = p; }
+        if (op.op === "update") {
+          if (sameState(next, was)) return skip("noop");
+          put(hit.list, hit.idx, next);
+          return done(`update: ${(next.title||"").trim()}`);
+        }
+        // move
+        const to = LISTS.indexOf(String(op.to||"")) >= 0 ? String(op.to) : "";
+        if (!to) return skip("no-such-list");
+        if (to === hit.list) {
+          if (sameState(next, was)) return skip("noop");
+          put(hit.list, hit.idx, next);
+          return done(`update: ${(next.title||"").trim()}`);
+        }
+        pull(hit.list, hit.idx);
+        if (to === "done") next.doneAt = ts();
+        n = { ...n, [to]: [next, ...(n[to]||[])] };
+        return done(`${(next.title||"").trim()} → ${to}`);
+      });
+
+      const applied = results.filter(r => r.ok).length;
+      return { state: n, results, applied, skipped: results.length - applied };
     };
     // ═══ END DATA CORE ═══════════════════════════════════════════
 
@@ -608,6 +814,329 @@
       ready() { if (this.available()) { try { AndroidWidget.notifyReady(); } catch {} } },
     };
 
+    // ── Claude (Anthropic Messages API) — optional, browser-direct ───────────
+    // Same shape as Drive: the browser talks to the vendor API itself so the phone
+    // and the GitHub Pages mirror work with no server. `anthropic-dangerous-direct-
+    // browser-access` is what opts the API into sending CORS headers — without it the
+    // preflight fails. That means the key lives in THIS DEVICE's localStorage, so it
+    // is deliberately kept out of `items`: gtd_state_v1 goes to OneDrive, to the hub,
+    // and into every exported backup, and an API key must reach none of those.
+    // Use a dedicated key with a spend limit set in the Anthropic Console.
+    const AI_KEY_LS  = "gtd_anthropic_key";      // device-local, like OD_FLAG
+    const AI_URL     = "https://api.anthropic.com/v1/messages";
+    const AI_MODEL   = "claude-opus-5";
+    const AI_VERSION = "2023-06-01";
+    const AI_TIMEOUT = 90000;
+
+    const Ai = {
+      key()     { try { return localStorage.getItem(AI_KEY_LS) || ""; } catch { return ""; } },
+      enabled() { return !!this.key(); },
+      setKey(k) {
+        try { const v = (k||"").trim(); v ? localStorage.setItem(AI_KEY_LS, v) : localStorage.removeItem(AI_KEY_LS); }
+        catch {}
+      },
+      masked()  { const k = this.key(); return k ? k.slice(0,7) + "…" + k.slice(-4) : ""; },
+      online()  { return typeof navigator === "undefined" || navigator.onLine !== false; },
+      _headers() {
+        return {
+          "content-type": "application/json",
+          "x-api-key": this.key(),
+          "anthropic-version": AI_VERSION,
+          "anthropic-dangerous-direct-browser-access": "true",
+        };
+      },
+      // Errors never escape into React (same contract as Drive): every failure comes
+      // back as {ok:false, code, msg}. `code` is what the UI branches on.
+      _fail(code, msg, extra) { return { ok:false, code, msg, ...(extra||{}) }; },
+      async _err(res) {
+        let detail = "";
+        try { const b = await res.json(); detail = (b && b.error && b.error.message) || ""; } catch {}
+        if (res.status === 401) return this._fail("auth", "That API key was rejected. Check it in Sync & Backup → Claude.");
+        if (res.status === 403) return this._fail("perm", "This key isn't allowed to call the Messages API.");
+        if (res.status === 429) {
+          const ra = res.headers.get("retry-after");
+          return this._fail("rate", ra ? `Rate limited — try again in ${ra}s.` : "Rate limited — try again shortly.", { retryAfter: ra });
+        }
+        if (res.status === 400) return this._fail("bad-request", detail || "The request was rejected.");
+        if (res.status === 529 || res.status === 503) return this._fail("overloaded", "Claude is busy right now — try again shortly.");
+        if (res.status >= 500) return this._fail("server", "Anthropic had a server error.");
+        return this._fail("http", detail || `Request failed (${res.status}).`);
+      },
+      // → {ok:true, msg} | {ok:false, code, msg}
+      async send(body, o) {
+        const opt = o || {};
+        if (!this.enabled()) return this._fail("no-key", "No API key set.");
+        if (!this.online())  return this._fail("offline", "Offline — Claude needs a connection.");
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), opt.timeout || AI_TIMEOUT);
+        const onOuter = () => ctrl.abort();
+        if (opt.signal) opt.signal.addEventListener("abort", onOuter);
+        try {
+          const res = await fetch(AI_URL, { method:"POST", headers:this._headers(), body:JSON.stringify(body), signal:ctrl.signal });
+          if (!res.ok) return await this._err(res);
+          return { ok:true, msg: await res.json() };
+        } catch (e) {
+          if (opt.signal && opt.signal.aborted) return this._fail("cancelled", "Cancelled.");
+          if (e && e.name === "AbortError")     return this._fail("timeout", "Timed out waiting for Claude.");
+          // A stripped CORS preflight (proxy, VPN, content blocker) is indistinguishable
+          // from being offline here, so the message has to name both possibilities.
+          return this._fail("network", "Couldn't reach the API — offline, or the request was blocked.");
+        } finally {
+          clearTimeout(timer);
+          if (opt.signal) opt.signal.removeEventListener("abort", onOuter);
+        }
+      },
+      // Structured (non-chat) call. Checks stop_reason BEFORE parsing, so a refusal or
+      // a truncated answer reports itself instead of surfacing as a bogus JSON error.
+      // → {ok:true, data, usage} | {ok:false, code, msg}
+      async structured(body, o) {
+        const r = await this.send(body, o);
+        if (!r.ok) return r;
+        const m = r.msg || {};
+        if (m.stop_reason === "refusal")    return this._fail("refusal", "Claude declined that request.");
+        if (m.stop_reason === "max_tokens") return this._fail("truncated", "The answer was cut off — try a narrower scope.");
+        const blocks = Array.isArray(m.content) ? m.content.filter(b => b && b.type === "text") : [];
+        const text   = blocks.length ? blocks[blocks.length - 1].text : "";
+        try { return { ok:true, data: JSON.parse(text), usage: m.usage || null }; }
+        catch { return this._fail("parse", "Claude's answer wasn't valid JSON."); }
+      },
+      // Streaming chat. Yields {t:"text"} chunks, then one {t:"done"}.
+      async *stream(body, o) {
+        const opt = o || {};
+        if (!this.enabled()) { yield { t:"error", ...this._fail("no-key", "No API key set.") }; return; }
+        if (!this.online())  { yield { t:"error", ...this._fail("offline", "Offline — Claude needs a connection.") }; return; }
+        let res;
+        try {
+          res = await fetch(AI_URL, { method:"POST", headers:this._headers(),
+                                      body:JSON.stringify({ ...body, stream:true }), signal:opt.signal });
+        } catch (e) {
+          yield { t:"error", ...(opt.signal && opt.signal.aborted
+            ? this._fail("cancelled", "Cancelled.")
+            : this._fail("network", "Couldn't reach the API — offline, or the request was blocked.")) };
+          return;
+        }
+        if (!res.ok)   { yield { t:"error", ...(await this._err(res)) }; return; }
+        if (!res.body) {                                   // very old WebView: fall back whole
+          const r = await this.send(body, opt);
+          if (!r.ok) { yield { t:"error", ...r }; return; }
+          const b = (r.msg.content||[]).filter(x => x.type === "text");
+          if (b.length) yield { t:"text", text: b[b.length-1].text };
+          yield { t:"done", stopReason: r.msg.stop_reason, usage: r.msg.usage };
+          return;
+        }
+        const reader = res.body.getReader(), dec = new TextDecoder();
+        let buf = "", stopReason = null, usage = null;
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream:true });
+            const lines = buf.split("\n");
+            buf = lines.pop();                              // keep the partial line
+            for (const line of lines) {
+              if (!line.startsWith("data:")) continue;
+              const raw = line.slice(5).trim();
+              if (!raw || raw === "[DONE]") continue;
+              let ev; try { ev = JSON.parse(raw); } catch { continue; }
+              if (ev.type === "content_block_delta" && ev.delta && ev.delta.type === "text_delta") {
+                yield { t:"text", text: ev.delta.text };    // thinking_delta is ignored on purpose
+              } else if (ev.type === "message_delta") {
+                stopReason = (ev.delta && ev.delta.stop_reason) || stopReason;
+                usage = ev.usage || usage;
+              } else if (ev.type === "error") {
+                yield { t:"error", ...this._fail("stream", (ev.error && ev.error.message) || "Stream error.") };
+                return;
+              }
+            }
+          }
+        } catch (e) {
+          yield { t:"error", ...(opt.signal && opt.signal.aborted
+            ? this._fail("cancelled", "Cancelled.")
+            : this._fail("network", "The connection dropped mid-answer.")) };
+          return;
+        }
+        yield { t:"done", stopReason, usage };
+      },
+      // Cheapest possible round trip — proves the key and the CORS path in one click.
+      async ping() {
+        const r = await this.send({ model:AI_MODEL, max_tokens:1, thinking:{ type:"disabled" },
+                                    output_config:{ effort:"low" },
+                                    messages:[{ role:"user", content:"hi" }] }, { timeout:20000 });
+        return r.ok ? { ok:true } : r;   // stop_reason max_tokens is expected and fine
+      },
+    };
+
+    // ── The four AI tasks ────────────────────────────────────────────────────
+    // Every structured task returns { ok, data, refs } where `data.ops` is fed to
+    // applyAiOps against `refs`. The op enum below is DERIVED from AI_OPS so the
+    // schema and the applier cannot drift (there's a test pinning that).
+    const AI_OP_SCHEMA = {
+      type: "object", additionalProperties: false, required: ["op"],
+      properties: {
+        op:      { type:"string", enum: AI_OPS },
+        ref:     { type:"string", description:"Alias of an existing item (n3, p1, w2). Required for every op except add." },
+        as:      { type:"string", description:"Temporary alias for an item you are adding, so a later op in this same batch can reference it." },
+        list:    { type:"string", enum: AI_ADD_LISTS, description:"Where an added item goes." },
+        to:      { type:"string", enum: LISTS, description:"Destination list for move." },
+        title:   { type:"string" },
+        project: { type:"string", description:"Alias (p2) or the exact title of an existing project. \"\" unlinks." },
+        context: { type:"string", description:"Must be one of the user's existing contexts." },
+        dueDate: { type:"string", description:"YYYY-MM-DD. Only a real deadline the user actually stated." },
+        dueTime: { type:"string", description:"HH:MM, 24h. Only with dueDate, and only for a true appointment." },
+        startDate:{ type:"string", description:"YYYY-MM-DD. Tickler — hides the item until that day." },
+        waitingFor:{ type:"string", description:"Who the item is blocked on." },
+        energy:  { type:"string", enum: ["", ...ENERGIES] },
+        time:    { type:"string", enum: ["", ...TIMES] },
+        on:      { type:"boolean", description:"focus on/off" },
+        why:     { type:"string", description:"At most 12 words. Shown to the user beside the proposed change." },
+      },
+    };
+
+    // Frozen across calls of the same task — this is the only part worth caching.
+    const AI_GTD_RULES = [
+      "You are a Getting Things Done (GTD) assistant embedded in the user's own trusted system.",
+      "You never change anything yourself: you propose ops, the user reviews them, the app applies them.",
+      "",
+      "Lists and what they mean:",
+      "- inbox: captured, not yet decided. Nothing stays here.",
+      "- next: a physical, visible action that can be started right now. Not a topic, not a goal.",
+      "- projects: an outcome needing more than one action. A project is not an action.",
+      "- waiting: delegated or blocked on someone else. Always set waitingFor.",
+      "- someday: worth doing, not now. No due date.",
+      "- reference: not actionable, kept for lookup.",
+      "",
+      "Hard rules:",
+      "- Reference existing items ONLY by the aliases you were shown. Never invent one.",
+      "- Use only contexts from the user's list. If none fits, omit context.",
+      "- Never invent a due date. A due date is a real external deadline, not a wish.",
+      "- Start a next action with a verb: 'Email Lan the draft', not 'Lan / draft'.",
+      "- Keep `why` under 12 words.",
+    ].join("\n");
+
+    const aiSys = (rules, projection, cache) => {
+      const blocks = [{ type:"text", text: rules }];
+      if (cache) blocks[0].cache_control = { type:"ephemeral" };
+      if (projection) blocks.push({ type:"text", text: projection });
+      return blocks;
+    };
+    const aiCtxLine = state => "The user's contexts: " + ((state.contexts||CONTEXTS).join(", "));
+
+    const AiTasks = {
+      // 1. Clarify one inbox item into its GTD outcome.
+      async clarify(state, item, todayISO, o) {
+        const p = aiProjection(state, todayISO, { lists:["projects","someday"], fields:"title" });
+        const rules = AI_GTD_RULES + "\n\n" + [
+          "TASK: clarify ONE captured item.",
+          "Decide what it is, then propose the ops that put it where it belongs.",
+          "The outcome is exactly one of: trash it, file it as reference, park it in someday,",
+          "make it a single next action, or make it a project WITH exactly one first next action",
+          "(add the project with `as`, then add that one action with project set to that alias).",
+          "If it is already a fine next action, say so and propose the ops that sharpen it.",
+          "Set `actionable` false only when the item needs no action at all.",
+        ].join("\n");
+        const r = await Ai.structured({
+          model: AI_MODEL, max_tokens: 2000,
+          thinking: { type:"adaptive" },
+          output_config: { effort:"low", format: { type:"json_schema", schema: {
+            type:"object", additionalProperties:false, required:["actionable","reasoning","ops"],
+            properties: {
+              actionable: { type:"boolean" },
+              reasoning:  { type:"string", description:"One short sentence, shown to the user." },
+              ops:        { type:"array", maxItems:6, items: AI_OP_SCHEMA },
+            } } } },
+          system: aiSys(rules, aiCtxLine(state) + "\n\nExisting projects:\n" + (p.text || "(none)"), true),
+          messages: [{ role:"user", content:
+            `Today is ${todayISO}.\nThe captured item is alias ${o.ref}: "${(item.title||"").trim()}"` }],
+        }, o);
+        return r.ok ? { ...r, refs: { ...p.refs, [o.ref]: item.id } } : r;
+      },
+
+      // 2. Break a project down — deliberately ONE next action.
+      async breakdown(state, proj, todayISO, o) {
+        const linked = LISTS.filter(l => l!=="done")
+          .reduce((a,l) => a.concat((state[l]||[]).filter(i => i.projectId === proj.id).map(i => `- [${l}] ${i.title}`)), []);
+        const rules = AI_GTD_RULES + "\n\n" + [
+          "TASK: get this project moving.",
+          "State the outcome, name the single very next physical action, then propose ops.",
+          "Emit EXACTLY ONE `add` into `next`, always with project set to the project's alias.",
+          "Later steps belong in `someday` linked to the same project, or in the outcome text —",
+          "a Next Actions list stuffed with not-yet-actionable steps is the classic GTD failure.",
+          "If the project is already blocked on a person, propose a `waiting` item instead.",
+        ].join("\n");
+        const r = await Ai.structured({
+          model: AI_MODEL, max_tokens: 3000,
+          thinking: { type:"adaptive" },
+          output_config: { effort:"medium", format: { type:"json_schema", schema: {
+            type:"object", additionalProperties:false, required:["outcome","nextAction","ops"],
+            properties: {
+              outcome:    { type:"string", description:"What 'done' looks like, in one sentence." },
+              nextAction: { type:"string", description:"The single very next physical action." },
+              ops:        { type:"array", maxItems:12, items: AI_OP_SCHEMA },
+            } } } },
+          system: aiSys(rules, aiCtxLine(state), false),
+          messages: [{ role:"user", content:
+            `Today is ${todayISO}.\nProject alias p1: "${(proj.title||"").trim()}"` +
+            (proj.dueDate ? `\nDue ${proj.dueDate}` : "") +
+            `\n\nAlready linked to it:\n${linked.length ? linked.join("\n") : "(nothing — this project is stalled)"}` }],
+        }, o);
+        return r.ok ? { ...r, refs: { p1: proj.id } } : r;
+      },
+
+      // 3. Weekly Review coach. The app already COUNTED everything — Claude judges.
+      async review(state, facts, todayISO, o) {
+        const p = aiProjection(state, todayISO, { lists:["inbox","next","waiting","projects","someday"], max:120 });
+        const rules = AI_GTD_RULES + "\n\n" + [
+          "TASK: coach this Weekly Review.",
+          "The counts below were computed by the app and are correct — do not recount them,",
+          "and do not simply read them back. Your job is the judgement the numbers can't make:",
+          "which stalled project actually matters this week, which next actions are really",
+          "projects in disguise, who needs chasing, what should be let go, where to focus.",
+          "Every observation must name the aliases it is about.",
+          "Propose only ops you are confident about — an unwanted op costs the user more",
+          "than a missing one. Zero ops is a perfectly good answer.",
+        ].join("\n");
+        const r = await Ai.structured({
+          model: AI_MODEL, max_tokens: 8000,
+          thinking: { type:"adaptive", display:"summarized" },
+          output_config: { effort:"high", format: { type:"json_schema", schema: {
+            type:"object", additionalProperties:false, required:["headline","observations","ops"],
+            properties: {
+              headline: { type:"string", description:"One sentence on the health of the system." },
+              observations: { type:"array", maxItems:6, items: {
+                type:"object", additionalProperties:false, required:["phase","text"],
+                properties: {
+                  phase: { type:"string", enum:["clear","current","creative"] },
+                  text:  { type:"string" },
+                  refs:  { type:"array", items:{ type:"string" } },
+                } } },
+              ops: { type:"array", maxItems:20, items: AI_OP_SCHEMA },
+            } } } },
+          system: aiSys(rules, aiCtxLine(state) + "\n\n" + p.text, false),
+          messages: [{ role:"user", content: `Today is ${todayISO}.\n\nCounts the app computed:\n${facts}` }],
+        }, { timeout: 180000, ...(o||{}) });
+        return r.ok ? { ...r, refs: p.refs, truncated: p.truncated } : r;
+      },
+
+      // 4. Chat — read-only by contract, so no ops and no schema.
+      chatBody(state, history, todayISO) {
+        const p = aiProjection(state, todayISO, { lists:["inbox","next","waiting","projects","someday"], max:120 });
+        const rules = AI_GTD_RULES + "\n\n" + [
+          "TASK: answer questions about the user's system.",
+          "You CANNOT change anything here. If asked to, name the button to press, or point",
+          "them at Clarify (in Process) or Break down (on a project card).",
+          "Answer from the data you were given. Say plainly when something isn't in it.",
+          "Be short. This is a sidebar, not an essay.",
+        ].join("\n");
+        return {
+          model: AI_MODEL, max_tokens: 4000,
+          thinking: { type:"adaptive", display:"summarized" },
+          output_config: { effort:"medium" },
+          system: aiSys(rules, aiCtxLine(state) + "\n\nToday is " + todayISO + "\n\n" + p.text, true),
+          messages: history.slice(-24),
+        };
+      },
+    };
+
     // ── Data portability: export / import a JSON backup ──────────
     // Offline, server-free way to move data between devices and to back it up.
     // Export → a downloadable (or shareable, on mobile) gtd-backup-*.json file
@@ -660,7 +1189,7 @@
 
     function App() {
       const [items, setItems]             = useState(null);
-      const [active, setActive]           = useState(LAUNCH.view || "today");
+      const [active, setActive]           = useState(LAUNCH.view || "today");   // "chat" needs a key — see the guard below
       const [ctx, setCtx]                 = useState("all");
       const [capture, setCapture]         = useState("");
       const [showForm, setShowForm]       = useState(false);
@@ -683,6 +1212,10 @@
       // OneDrive cloud sync (optional)
       const [odAccount, setOdAccount]     = useState(() => Drive.account());
       const [syncing,   setSyncing]       = useState(false);
+      // Claude: the key lives in localStorage, not in state, so a save/clear has to
+      // nudge React by hand for the AI affordances to appear or vanish without a reload.
+      const [aiKeyTick, setAiKeyTick]     = useState(0);
+      const [aiTest,    setAiTest]        = useState(null);   // null | "…" | {ok} | {ok:false,msg}
       const [syncTick,  setSyncTick]      = useState(0);   // bump to re-render the "last synced" label
       const [archive, setArchiveState] = useState([]);   // rotated-out old Done items (separate store)
       const itemsRef    = React.useRef(null);
@@ -861,6 +1394,19 @@
         await Drive.disconnect(); setOdAccount(null); setSyncTick(t => t + 1);
       }, []);
 
+      // ── Claude ──
+      // No key ⇒ every AI affordance is ABSENT (a configuration state, identical to
+      // before the feature existed). Key set but offline ⇒ rendered and disabled
+      // (a transient state). The two are deliberately not the same.
+      const aiOn     = React.useMemo(() => Ai.enabled(), [aiKeyTick]);
+      const aiOnline = Ai.online();
+      const saveAiKey = useCallback(k => { Ai.setKey(k); setAiTest(null); setAiKeyTick(t => t + 1); }, []);
+      const testAiKey = useCallback(async () => {
+        setAiTest("…");
+        const r = await Ai.ping();
+        setAiTest(r.ok ? { ok:true } : { ok:false, msg:r.msg });
+      }, []);
+
       // Every mutation flows through here: stampChanges gives each touched item a
       // fresh per-item _updatedAt (the merge clock) — call sites never stamp.
       const upd = useCallback(d => {
@@ -869,6 +1415,68 @@
         setItems(stamped);
         persist(stamped);
       }, [items, persist]);
+
+      // One job at a time: {kind, target, busy, error, data, refs}. Clarify, breakdown
+      // and the review coach all run through here so there is one place that reads the
+      // live state, one abort, and one error surface.
+      const [aiJob, setAiJob] = useState(null);
+      useEffect(() => { if (active === "chat" && !Ai.enabled()) setActive("today"); }, [active, aiKeyTick]);
+      const aiAbort = React.useRef(null);
+      const runAi = useCallback(async (kind, target) => {
+        if (aiAbort.current) aiAbort.current.abort();
+        const ctrl = new AbortController(); aiAbort.current = ctrl;
+        setAiJob({ kind, target, busy:true, error:"", data:null, refs:{} });
+        const cur = itemsRef.current || fresh(), day = isoDate(new Date());
+        const r = kind === "clarify"   ? await AiTasks.clarify(cur, target, day, { ref:"c1", signal:ctrl.signal })
+                : kind === "breakdown" ? await AiTasks.breakdown(cur, target, day, { signal:ctrl.signal })
+                :                        await AiTasks.review(cur, target, day, { signal:ctrl.signal });
+        if (ctrl.signal.aborted) return;
+        setAiJob(j => j && j.kind === kind
+          ? { ...j, busy:false, error: r.ok ? "" : r.msg, data: r.ok ? r.data : null, refs: r.refs || {} }
+          : j);
+      }, []);
+      const closeAi = useCallback(() => {
+        if (aiAbort.current) { aiAbort.current.abort(); aiAbort.current = null; }
+        setAiJob(null);
+      }, []);
+      // Read itemsRef, NOT the `items` closure: an AI panel can sit open across a 45s
+      // sync poll, and applying against a dead snapshot would clobber what just merged
+      // in. Same reason drainWidgetOps does it. Re-running applyAiOps here also means
+      // an op whose target vanished in the meantime comes back honestly skipped.
+      const applyAi = useCallback((ops, refs) => {
+        const cur = itemsRef.current || fresh();
+        const res = applyAiOps(cur, ops, { refs: refs || {}, todayISO: isoDate(new Date()) });
+        if (res.state !== cur) upd(res.state);          // ONE stamped transition — Ctrl+Z undoes it all
+        return res;
+      }, [upd]);
+      // The preview IS the applier, run against live state — same function, same result.
+      const aiPreview = React.useMemo(() => {
+        if (!aiJob || !aiJob.data) return null;
+        const ops = aiJob.data.ops || [];
+        return { ops, results: applyAiOps(items, ops, { refs: aiJob.refs, todayISO: isoDate(new Date()) }).results };
+      }, [aiJob, items]);
+      // One bundle shape for all three mutating surfaces, so they render identically.
+      const aiPanel = kind => {
+        if (!aiOn) return null;
+        const job = aiJob && aiJob.kind === kind ? aiJob : null;
+        const d   = job && job.data;
+        const notes = !d ? []
+          : kind === "clarify"   ? [d.reasoning].filter(Boolean)
+          : kind === "breakdown" ? [d.outcome && ("Outcome: " + d.outcome), d.nextAction && ("Next action: " + d.nextAction)].filter(Boolean)
+          :                        [d.headline].filter(Boolean);
+        return {
+          online: aiOnline, active: !!job, busy: !!(job && job.busy), error: job ? job.error : "",
+          data: d || null, notes,
+          ops:     aiPreview ? aiPreview.ops : [],
+          results: aiPreview ? aiPreview.results : [],
+          onApply: chosen => {
+            const ops = (aiPreview ? aiPreview.ops : []).filter((_, i) => chosen.indexOf(i) >= 0);
+            applyAi(ops, job ? job.refs : {});
+            closeAi();
+          },
+          onClose: closeAi,
+        };
+      };
 
       // ── Android widget → app: apply whatever the home screen queued ──────────
       // The whole batch goes in as ONE state transition: calling confirmComplete /
@@ -1234,10 +1842,11 @@
               </div>
             </div>
             <nav style={{flex:1,padding:"6px 8px"}}>
-              {NAV.map(l => {
+              {NAV.filter(l => l!=="chat" || aiOn).map(l => {
                 const m=META[l], on=active===l;
                 const reviewPill = l==="review" && reviewDue;
-                const badge = l==="done" ? todayDone : l==="calendar" ? plannedCount : l==="today" ? todayFocus.count : l==="review" ? 0 : counts[l];
+                const badge = l==="done" ? todayDone : l==="calendar" ? plannedCount : l==="today" ? todayFocus.count
+                            : (l==="review"||l==="chat") ? 0 : counts[l];
                 return (
                   <button key={l} onClick={()=>{setActive(l);setCtx("all");setShowForm(false);setNavOpen(false);}}
                     style={{display:"flex",alignItems:"center",justifyContent:"space-between",width:"100%",padding:"8px 10px",background:on?"rgba(99,102,241,.18)":"transparent",border:"none",borderRadius:7,cursor:"pointer",color:on?"#a5b4fc":"#64748b",fontSize:12,fontWeight:on?600:400,textAlign:"left",marginBottom:1}}>
@@ -1292,7 +1901,7 @@
                   <button onClick={pipOn?closePip:openPip} title={pipOn?"Close the floating window":"Pop out a floating, always-on-top Today window"}
                     className={"btn btn-sm "+(pipOn?"btn-pri":"btn-ghost")}>⤢ {pipOn?"Floating":"Float"}</button>
                 )}
-                {active!=="done" && active!=="calendar" && active!=="today" && active!=="review" && (
+                {active!=="done" && active!=="calendar" && active!=="today" && active!=="review" && active!=="chat" && (
                   <button onClick={()=>setShowForm(s=>!s)} className="btn btn-pri btn-sm">{showForm?"Cancel":"+ Add"}</button>
                 )}
               </div>
@@ -1387,11 +1996,14 @@
                   onComplete={(list,item)=>setComplCand({list,item})}
                   onEdit={(list,item)=>setEditCand({list,item})}
                   onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}/>
+              ) : active==="chat" ? (
+                <ChatView items={items} todayISO={todayISO}/>
               ) : active==="review" ? (
                 <WeeklyReview items={items} todayISO={todayISO} reviewedAt={reviewedAt} daysSinceReview={daysSinceReview}
                   reviewDay={reviewDay} onSetReviewDay={setReviewDay}
                   onComplete={markReviewed}
-                  onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}/>
+                  onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}
+                  ai={aiOn ? { ...aiPanel("review"), onRun: facts => runAi("review", facts) } : null}/>
               ) : active==="projects" ? (
                 shown.length===0
                   ? <EmptyState list="projects"/>
@@ -1401,7 +2013,8 @@
                         onEdit={()=>setEditCand({list:"projects",item:p})}
                         onCompleteAction={(l,id)=>setComplCand({list:l,item:(items[l]||[]).find(i=>i.id===id)})}
                         onDeleteAction={(l,id)=>del(l,id)}
-                        onStalledDecision={handleStalledDecision}/>
+                        onStalledDecision={handleStalledDecision}
+                        onAiBreakdown={aiOn ? (pr=>runAi("breakdown", pr)) : null}/>
                     ))
               ) : active==="done" ? (
                 <DoneView items={shown} pnameOf={pnameOf} archiveCount={archive.length} move={move} del={del}/>
@@ -1471,6 +2084,10 @@
                 lastSynced: lastSyncRef.current,
                 onConnect: connectDrive, onDisconnect: disconnectDrive, onSyncNow: syncNow,
               }}
+              ai={{
+                hasKey: aiOn, masked: Ai.masked(), model: AI_MODEL, online: aiOnline,
+                test: aiTest, onSave: saveAiKey, onClear: ()=>saveAiKey(""), onTest: testAiKey,
+              }}
               onClose={()=>setShowData(false)}/>
           )}
 
@@ -1499,8 +2116,13 @@
               onConfirm={patch => { applyEdit(editCand.list, editCand.item, patch); setEditCand(null); }}
               onClose={()=>setEditCand(null)}/>
           )}
+          {aiJob && aiJob.kind==="breakdown" && (
+            <AiModal title="✨ Break down a project" subtitle={aiJob.target ? aiJob.target.title : ""}
+              ai={{ ...aiPanel("breakdown"), onRun: ()=>runAi("breakdown", aiJob.target) }}/>
+          )}
           {procItem && (
             <ProcessModal item={procItem} ctxs={ctxs}
+              ai={aiOn ? { ...aiPanel("clarify"), onRun: ()=>runAi("clarify", procItem) } : null}
               onMove={(to,patch)=>move("inbox",procItem.id,to,patch)}
               onMoveAsProject={(patch, first) => {
                 const src = items.inbox.find(i=>i.id===procItem.id); if (!src) return;
@@ -1588,7 +2210,7 @@
     }
 
     // ── ProjCard ──────────────────────────────────────────────────
-    function ProjCard({ proj, actions, waiting, ctxs, onDelete, onEdit, onCompleteAction, onDeleteAction, onStalledDecision }) {
+    function ProjCard({ proj, actions, waiting, ctxs, onDelete, onEdit, onCompleteAction, onDeleteAction, onStalledDecision, onAiBreakdown }) {
       const [open, setOpen]           = useState(false);
       const [stalledPhase, setStalledPhase] = useState(null); // null | "define" | "waiting"
       const [naTitle, setNaTitle]     = useState("");
@@ -1614,6 +2236,10 @@
               </div>
               <div style={{fontSize:11,color:"#64748b",marginTop:2}}>{actions.length} active action{actions.length!==1?"s":""}{waiting.length?` · ${waiting.length} waiting`:""}{proj.dueDate?` · 📅 ${proj.dueDate}`:""}</div>
             </div>
+            {onAiBreakdown&&(
+              <button onClick={e=>{e.stopPropagation();onAiBreakdown(proj);}} title="Ask Claude for the next action"
+                className="ibtn" style={{fontSize:13}}>✨</button>
+            )}
             {onEdit&&(
               <button onClick={e=>{e.stopPropagation();onEdit();}} title="Edit" className="ibtn" style={{fontSize:13}}>✎</button>
             )}
@@ -1639,6 +2265,13 @@
                         🎉 Mark complete
                         <div style={{fontSize:10,fontWeight:400,color:"#10b981",marginTop:1}}>Outcome achieved</div>
                       </button>
+                      {onAiBreakdown && (
+                        <button onClick={()=>onAiBreakdown(proj)}
+                          style={{padding:"9px 10px",background:"#faf5ff",border:"1.5px solid #c4b5fd",borderRadius:8,cursor:"pointer",fontSize:11,fontWeight:600,color:"#5b21b6",textAlign:"left"}}>
+                          ✨ Ask Claude
+                          <div style={{fontSize:10,fontWeight:400,color:"#8b5cf6",marginTop:1}}>Name the very next action</div>
+                        </button>
+                      )}
                       <button onClick={()=>setStalledPhase("waiting")}
                         style={{padding:"9px 10px",background:"#eff6ff",border:"1.5px solid #93c5fd",borderRadius:8,cursor:"pointer",fontSize:11,fontWeight:600,color:"#1e40af",textAlign:"left"}}>
                         ⏳ Waiting for…
@@ -2272,7 +2905,7 @@
     // GTD's keystone Reflect habit, as a guided checklist: get clear → get current →
     // get creative. Surfaces live counts (inbox, stalled projects, stale waiting-for,
     // overdue) so the review is actionable; completing it stamps _reviewedAt.
-    function WeeklyReview({ items, todayISO, reviewedAt, daysSinceReview, reviewDay, onSetReviewDay, onComplete, onGoto }) {
+    function WeeklyReview({ items, todayISO, reviewedAt, daysSinceReview, reviewDay, onSetReviewDay, onComplete, onGoto, ai }) {
       const [done, setDone] = useState({});
       const toggle = k => setDone(d => ({ ...d, [k]: !d[k] }));
       const WD = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
@@ -2292,22 +2925,32 @@
       DATED.forEach(l=>(items[l]||[]).forEach(i=>{ if(i.dueDate){ i.dueDate<todayISO ? overdue++ : upcoming++; }}));
 
       const phases = [
-        { name:"1 · Get clear", color:"#0ea5e9", steps:[
+        { name:"1 · Get clear", key:"clear", color:"#0ea5e9", steps:[
           {k:"collect", label:"Collect loose papers & materials", hint:"Round up stray notes, receipts, cards — drop them in your Inbox."},
           {k:"inbox",   label:"Process your Inbox to zero", hint:"Decide what each item is and where it belongs — don't put anything back.", goto:"inbox", count:inbox, danger:inbox>0, note:inbox===0?"empty ✓":null},
           {k:"mind",    label:"Empty your head", hint:"Capture any uncaptured commitments, ideas, or open loops."},
         ]},
-        { name:"2 · Get current", color:"#6366f1", steps:[
+        { name:"2 · Get current", key:"current", color:"#6366f1", steps:[
           {k:"next",    label:"Review Next Actions", hint:"Tick off completed ones; is each still the real next step?", goto:"next", count:nextC},
           {k:"cal",     label:"Review Calendar — past & upcoming", hint:"Check last week for loose ends, the week ahead for commitments.", goto:"calendar", count:overdue+upcoming, danger:overdue>0, note:overdue>0?`${overdue} overdue`:null},
           {k:"waiting", label:"Review Waiting For", hint:"Anyone to follow up on or nudge?", goto:"waiting", count:waiting.length, note:staleWait>0?`${staleWait} over a week old`:null},
           {k:"projects",label:"Review Projects", hint:"Every active project needs a defined next action.", goto:"projects", count:projects.length, danger:stalled.length>0, note:stalled.length>0?`${stalled.length} stalled`:null},
           {k:"someday", label:"Review Someday/Maybe", hint:"Anything ready to activate? Anything to let go?", goto:"someday", count:someC},
         ]},
-        { name:"3 · Get creative", color:"#10b981", steps:[
+        { name:"3 · Get creative", key:"creative", color:"#10b981", steps:[
           {k:"creative", label:"Add new ideas & projects", hint:"What's possible now? Capture anything fresh that surfaced."},
         ]},
       ];
+      // The app has already COUNTED everything; the coach is handed those numbers so
+      // it spends its turn on judgement instead of re-deriving what we know exactly.
+      const facts = [
+        `inbox: ${inbox}`, `next actions: ${nextC}`, `waiting: ${waiting.length} (${staleWait} over a week old)`,
+        `projects: ${projects.length} (${stalled.length} stalled: ${stalled.map(p=>p.title).join("; ") || "none"})`,
+        `someday: ${someC}`, `dated: ${overdue} overdue, ${upcoming} upcoming`,
+        `weekly review: ${daysSinceReview===null ? "never run" : daysSinceReview + " days since the last one"}`,
+      ].join("\n");
+      const obsFor = key => ((ai && ai.data && ai.data.observations) || []).filter(o => o.phase === key);
+
       const allSteps  = phases.flatMap(p=>p.steps);
       const completed = allSteps.filter(s=>done[s.k]).length;
       const pct       = Math.round(completed/allSteps.length*100);
@@ -2338,6 +2981,23 @@
             )}
           </div>
 
+          {ai && (ai.active ? (
+            <AiOpsReview ops={ai.ops} results={ai.results} notes={ai.notes} busy={ai.busy} error={ai.error}
+              applyLabel="Apply" onApply={ai.onApply} onRetry={()=>ai.onRun(facts)} onCancel={ai.onClose}/>
+          ) : (
+            <button onClick={()=>ai.onRun(facts)} disabled={!ai.online}
+              title={ai.online ? "" : "Offline — Claude needs a connection"}
+              style={{width:"100%",padding:"10px 12px",marginBottom:14,textAlign:"left",
+                      background:ai.online?"#faf5ff":"#f8fafc",border:`1.5px solid ${ai.online?"#c4b5fd":"#e2e8f0"}`,
+                      borderRadius:9,cursor:ai.online?"pointer":"default",fontSize:12,fontWeight:600,
+                      color:ai.online?"#5b21b6":"#94a3b8"}}>
+              ✨ Coach me through this review
+              <div style={{fontSize:10,fontWeight:400,color:ai.online?"#8b5cf6":"#cbd5e1",marginTop:2}}>
+                Reads your lists and says what actually needs attention — nothing changes without your OK
+              </div>
+            </button>
+          ))}
+
           {/* progress */}
           <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:18}}>
             <div style={{flex:1,height:8,background:"#e2e8f0",borderRadius:20,overflow:"hidden"}}>
@@ -2351,6 +3011,12 @@
             {phases.map(ph=>(
               <div key={ph.name} style={{border:"1px solid #e2e8f0",borderRadius:12,background:"#f8fafc",padding:14,display:"flex",flexDirection:"column",gap:8}}>
                 <div style={{fontSize:10,fontWeight:700,color:ph.color,textTransform:"uppercase",letterSpacing:".8px",borderBottom:`2px solid ${ph.color}22`,paddingBottom:7}}>{ph.name}</div>
+                {obsFor(ph.key).map((o,k)=>(
+                  <div key={"obs"+k} style={{fontSize:11,color:"#5b21b6",background:"#faf5ff",border:"1px solid #ddd6fe",
+                                             borderRadius:8,padding:"8px 10px",lineHeight:1.5}}>
+                    ✨ {o.text}
+                  </div>
+                ))}
                 {ph.steps.map(s=>{
                   const on = !!done[s.k];
                   return (
@@ -2545,6 +3211,174 @@
     }
 
     // ── PromoteModal — turn a single next action into a project ───
+    // ── Review-before-apply — the ONE surface every AI proposal lands in ─────
+    // The preview IS applyAiOps run against the live state, so an op the model got
+    // wrong is already greyed out with a reason before the user commits to anything.
+    // Applying goes through a single upd, so Ctrl+Z undoes the whole batch at once.
+    const AI_REASON = {
+      "no-such-item":"that item is gone",     "no-such-list":"not a valid list",
+      "no-such-project":"no such project",    "empty-title":"empty title",
+      "wrong-list":"only next actions can be focused", "noop":"already true",
+      "unknown-op":"unsupported action",      "bad-shape":"malformed",
+      "too-many":"batch too long",
+    };
+    function AiOpsReview({ ops, results, notes, busy, error, onApply, onRetry, onCancel, applyLabel }) {
+      const [off, setOff] = useState({});
+      useEffect(() => { setOff({}); }, [results]);          // a fresh run starts fully ticked
+      const rows    = results || [];
+      const chosen  = rows.filter(r => r.ok && !off[r.i]).map(r => r.i);
+      const box     = {border:"1px solid #ddd6fe",background:"#faf5ff",borderRadius:9,padding:"11px 13px",marginBottom:10};
+
+      if (busy) return (
+        <div style={box}>
+          <div style={{fontSize:12,color:"#5b21b6",fontWeight:600}}>✨ Asking Claude…</div>
+          {onCancel && <button onClick={onCancel} className="btn btn-ghost btn-sm" style={{marginTop:8}}>Cancel</button>}
+        </div>
+      );
+      if (error) return (
+        <div style={{...box,borderColor:"#fca5a5",background:"#fef2f2"}}>
+          <div style={{fontSize:12,color:"#b91c1c",lineHeight:1.5}}>{error}</div>
+          <div style={{display:"flex",gap:6,marginTop:8}}>
+            {onRetry  && <button onClick={onRetry}  className="btn btn-pri btn-sm">Try again</button>}
+            {onCancel && <button onClick={onCancel} className="btn btn-ghost btn-sm">Dismiss</button>}
+          </div>
+        </div>
+      );
+      if (!rows.length && !(notes||[]).length) return null;
+
+      return (
+        <div style={box}>
+          {(notes||[]).map((n,k)=>(
+            <div key={k} style={{fontSize:12,color:"#4c1d95",lineHeight:1.5,marginBottom:6}}>{n}</div>
+          ))}
+          {rows.map(r => {
+            const op = (ops||[])[r.i] || {};
+            return (
+              <label key={r.i} style={{display:"flex",gap:8,alignItems:"flex-start",padding:"5px 0",
+                                       cursor:r.ok?"pointer":"default",opacity:r.ok?1:.5}}>
+                <input type="checkbox" disabled={!r.ok} checked={r.ok && !off[r.i]}
+                  onChange={()=>setOff(o=>({ ...o, [r.i]: !o[r.i] }))} style={{marginTop:2}}/>
+                <span style={{flex:1,minWidth:0}}>
+                  <span style={{fontSize:12,color:"#1e293b"}}>{r.effect || op.op}</span>
+                  {!r.ok && <span style={{fontSize:10,color:"#b91c1c",marginLeft:6}}>
+                    — skipped: {AI_REASON[r.reason] || r.reason}</span>}
+                  {op.why && <div style={{fontSize:10,color:"#94a3b8",marginTop:1}}>{op.why}</div>}
+                  {r.ok && r.clamped && r.clamped.length > 0 && (
+                    <div style={{fontSize:10,color:"#b45309",marginTop:1}}>ignored: {r.clamped.join(", ")}</div>
+                  )}
+                </span>
+              </label>
+            );
+          })}
+          <div style={{display:"flex",gap:6,marginTop:9}}>
+            <button onClick={()=>onApply(chosen)} disabled={!chosen.length}
+              style={{flex:1,padding:"8px",border:"none",borderRadius:7,fontSize:12,fontWeight:600,
+                      background:chosen.length?"#6366f1":"#e2e8f0",color:chosen.length?"#fff":"#94a3b8",
+                      cursor:chosen.length?"pointer":"default"}}>
+              {applyLabel || "Apply"} {chosen.length ? `${chosen.length} of ${rows.length}` : ""}
+            </button>
+            {onCancel && <button onClick={onCancel} className="btn btn-ghost btn-sm">Discard</button>}
+          </div>
+        </div>
+      );
+    }
+
+    // A proposal that has nowhere to live inline (project breakdown) gets an overlay.
+    function AiModal({ title, subtitle, ai }) {
+      const overlay = {position:"fixed",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200};
+      const box     = {background:"#fff",borderRadius:14,padding:22,width:460,maxWidth:"92vw",maxHeight:"92vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
+      return (
+        <div style={overlay} onClick={e=>e.target===e.currentTarget&&ai.onClose()}>
+          <div style={box}>
+            <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>{title}</div>
+            {subtitle && <div style={{fontSize:12,color:"#64748b",marginBottom:12,fontStyle:"italic"}}>"{subtitle}"</div>}
+            <AiOpsReview ops={ai.ops} results={ai.results} notes={ai.notes} busy={ai.busy} error={ai.error}
+              applyLabel="Add" onApply={ai.onApply} onRetry={ai.onRun} onCancel={ai.onClose}/>
+            <button onClick={ai.onClose} className="btn btn-ghost btn-sm" style={{width:"100%"}}>Close</button>
+          </div>
+        </div>
+      );
+    }
+
+    // ── Ask Claude — a derived view like Today/Calendar, and read-only ────────
+    // The conversation is component state ONLY: persisting it would push chat text
+    // into gtd_state_v1, and from there into OneDrive, the hub and every backup.
+    function ChatView({ items, todayISO }) {
+      const [msgs,  setMsgs]  = useState([]);        // [{role, content}]
+      const [draft, setDraft] = useState("");
+      const [live,  setLive]  = useState("");        // the answer currently streaming in
+      const [busy,  setBusy]  = useState(false);
+      const [error, setError] = useState("");
+      const [usage, setUsage] = useState({ in:0, out:0 });
+      const abort = React.useRef(null);
+      const foot  = React.useRef(null);
+      useEffect(() => { if (foot.current) foot.current.scrollIntoView({ block:"end" }); }, [msgs, live]);
+      useEffect(() => () => { if (abort.current) abort.current.abort(); }, []);   // leave the view, drop the request
+
+      const send = async () => {
+        const q = draft.trim();
+        if (!q || busy) return;
+        const history = [...msgs, { role:"user", content:q }];
+        setMsgs(history); setDraft(""); setLive(""); setError(""); setBusy(true);
+        const ctrl = new AbortController(); abort.current = ctrl;
+        let acc = "";
+        try {
+          // rebuilt every turn on purpose: a background sync may have changed the data
+          for await (const ev of Ai.stream(AiTasks.chatBody(items, history, todayISO), { signal:ctrl.signal })) {
+            if (ev.t === "text")  { acc += ev.text; setLive(acc); }
+            else if (ev.t === "error") { setError(ev.msg); break; }
+            else if (ev.t === "done" && ev.usage) {
+              setUsage(u => ({ in:u.in + (ev.usage.input_tokens||0), out:u.out + (ev.usage.output_tokens||0) }));
+            }
+          }
+        } finally {
+          if (acc) setMsgs(h => [...h, { role:"assistant", content:acc }]);
+          setLive(""); setBusy(false); abort.current = null;
+        }
+      };
+
+      const bubble = (role, text, k) => (
+        <div key={k} style={{display:"flex",justifyContent:role==="user"?"flex-end":"flex-start",marginBottom:8}}>
+          <div style={{maxWidth:"82%",padding:"9px 12px",borderRadius:12,fontSize:13,lineHeight:1.55,whiteSpace:"pre-wrap",
+                       background:role==="user"?"#6366f1":"#fff",color:role==="user"?"#fff":"#1e293b",
+                       border:role==="user"?"none":"1px solid #e2e8f0"}}>{text}</div>
+        </div>
+      );
+
+      return (
+        <div style={{maxWidth:760,margin:"0 auto",display:"flex",flexDirection:"column",height:"100%"}}>
+          <div style={{fontSize:15,fontWeight:700,marginBottom:2}}>✨ Ask Claude</div>
+          <div style={{fontSize:12,color:"#64748b",marginBottom:14}}>
+            Questions about your own system. Claude can read it but can't change anything —
+            use Clarify or Break down for that.
+          </div>
+          <div style={{flex:1,overflowY:"auto",marginBottom:10,minHeight:120}}>
+            {!msgs.length && !live && (
+              <div style={{fontSize:12,color:"#94a3b8",lineHeight:1.7}}>
+                Try: “what am I waiting on, and from whom?” · “what can I do in 15 minutes at my desk?”
+                · “which projects haven't moved?”
+              </div>
+            )}
+            {msgs.map((m,k)=>bubble(m.role, m.content, k))}
+            {live && bubble("assistant", live, "live")}
+            {busy && !live && <div style={{fontSize:11,color:"#94a3b8"}}>thinking…</div>}
+            {error && <div style={{fontSize:12,color:"#b91c1c",padding:"8px 0"}}>{error}</div>}
+            <div ref={foot}/>
+          </div>
+          <div style={{display:"flex",gap:6}}>
+            <input className="in in-sm" style={{flex:1}} value={draft} placeholder="Ask about your lists…"
+              onChange={e=>setDraft(e.target.value)} onKeyDown={e=>e.key==="Enter"&&send()}/>
+            {busy
+              ? <button onClick={()=>abort.current&&abort.current.abort()} className="btn btn-ghost btn-sm">Stop</button>
+              : <button onClick={send} disabled={!draft.trim()} className="btn btn-pri btn-sm">Send</button>}
+          </div>
+          <div style={{fontSize:10,color:"#cbd5e1",marginTop:6,textAlign:"right"}}>
+            {usage.in || usage.out ? `this session: ${usage.in} in / ${usage.out} out tokens` : ""}
+          </div>
+        </div>
+      );
+    }
+
     function PromoteModal({ item, onConfirm, onClose }) {
       const actionText = item.title;
       const [outcome, setOutcome] = useState("");
@@ -2695,7 +3529,7 @@
     }
 
     // ── ProcessModal ──────────────────────────────────────────────
-    function ProcessModal({ item, ctxs, onMove, onMoveAsProject, onTrash, onClose }) {
+    function ProcessModal({ item, ctxs, ai, onMove, onMoveAsProject, onTrash, onClose }) {
       const [due,       setDue]       = useState("");
       const [from,      setFrom]      = useState("");
       const [phase,     setPhase]     = useState("main"); // "main" | "project" | "doit"
@@ -2891,7 +3725,24 @@
         <div style={overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
           <div style={box}>
             <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>Clarify this item</div>
-            <div style={{fontSize:12,color:"#64748b",marginBottom:2,fontStyle:"italic"}}>"{item.title}"</div>
+            <div style={{fontSize:12,color:"#64748b",marginBottom:10,fontStyle:"italic"}}>"{item.title}"</div>
+
+            {ai && (ai.active ? (
+              <AiOpsReview ops={ai.ops} results={ai.results} notes={ai.notes} busy={ai.busy} error={ai.error}
+                applyLabel="Apply" onApply={ai.onApply} onRetry={ai.onRun} onCancel={ai.onClose}/>
+            ) : (
+              <button onClick={ai.onRun} disabled={!ai.online}
+                title={ai.online ? "" : "Offline — Claude needs a connection"}
+                style={{width:"100%",padding:"9px 12px",background:ai.online?"#faf5ff":"#f8fafc",
+                        border:`1.5px solid ${ai.online?"#c4b5fd":"#e2e8f0"}`,borderRadius:8,
+                        cursor:ai.online?"pointer":"default",fontSize:12,fontWeight:600,
+                        color:ai.online?"#5b21b6":"#94a3b8",textAlign:"left",marginBottom:4}}>
+                ✨ Ask Claude to clarify this
+                <div style={{fontSize:10,fontWeight:400,color:ai.online?"#8b5cf6":"#cbd5e1",marginTop:2}}>
+                  Suggests where it belongs — you approve before anything changes
+                </div>
+              </button>
+            ))}
 
             <Divider label="Actionable"/>
             <div style={{display:"flex",flexDirection:"column",gap:6}}>
@@ -2925,10 +3776,19 @@
     }
 
     // ── DataModal: cloud sync + offline export / import ──────────
-    function DataModal({ counts, archiveCount, contexts, onAddContext, onDelContext, onExport, onImport, cloud, onClose }) {
+    function DataModal({ counts, archiveCount, contexts, onAddContext, onDelContext, onExport, onImport, cloud, ai, onClose }) {
       const total   = LISTS.reduce((n,l)=>n+(counts[l]||0),0);
       const [newCtx, setNewCtx] = useState("");
       const fireAddCtx = () => { if(newCtx.trim()){ onAddContext(newCtx); setNewCtx(""); } };
+      const [key, setKey] = useState(""), [keyWarn, setKeyWarn] = useState("");
+      const a = ai || {};
+      // The plaintext key is dropped from component state the moment it is stored —
+      // it has no business living in a React tree any longer than the keystroke.
+      const saveKey = () => {
+        const v = key.trim(); if (!v) return;
+        setKeyWarn(v.startsWith("sk-ant-") ? "" : "That doesn't look like an Anthropic key, saving it anyway.");
+        a.onSave && a.onSave(v); setKey("");
+      };
       const overlay = {position:"fixed",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200};
       const box     = {background:"#fff",borderRadius:14,padding:22,width:420,maxWidth:"92vw",maxHeight:"92vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,.2)"};
       const card    = (bg,border,color) => ({padding:"11px 13px",background:bg,border:`1.5px solid ${border}`,borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:600,color,textAlign:"left",width:"100%"});
@@ -2975,6 +3835,55 @@
                 </div>
               </div>
             )}
+
+            <div style={head}>Claude — AI assistant</div>
+            {!a.hasKey ? (
+              <div style={{border:"1px solid #e2e8f0",borderRadius:8,padding:"11px 13px",marginBottom:16}}>
+                <div style={{fontSize:11,color:"#64748b",lineHeight:1.5,marginBottom:8}}>
+                  Paste an Anthropic API key to turn on Clarify, project breakdowns, the Weekly
+                  Review coach and Ask Claude. Leave it blank and the app behaves exactly as before.
+                </div>
+                <div style={{display:"flex",gap:6}}>
+                  <input className="in in-sm" style={{flex:1}} type="password" value={key}
+                    autoComplete="off" spellCheck={false} placeholder="sk-ant-…"
+                    onChange={e=>setKey(e.target.value)} onKeyDown={e=>e.key==="Enter"&&saveKey()}/>
+                  <button onClick={saveKey} className="btn btn-pri btn-sm">Save</button>
+                </div>
+                {keyWarn && <div style={{fontSize:10,color:"#b45309",marginTop:6}}>{keyWarn}</div>}
+                <div style={{fontSize:10,color:"#94a3b8",marginTop:6}}>
+                  Get one at console.anthropic.com. Each device needs its own — the key is never synced.
+                </div>
+              </div>
+            ) : (
+              <div style={{border:"1px solid #e2e8f0",borderRadius:8,padding:"11px 13px",marginBottom:16}}>
+                <div style={{fontSize:12,fontWeight:600,color:"#1e293b",marginBottom:2}}>✨ Key saved</div>
+                <div style={{fontSize:11,color:"#64748b",marginBottom:2,wordBreak:"break-all"}}>{a.masked}</div>
+                <div style={{fontSize:10,color:"#94a3b8",marginBottom:10}}>
+                  {a.model}{!a.online && " · offline"}
+                </div>
+                <div style={{display:"flex",gap:7}}>
+                  <button onClick={a.onTest} disabled={a.test==="…"}
+                    style={{flex:1,padding:"7px",background:a.test==="…"?"#e2e8f0":"#6366f1",color:a.test==="…"?"#94a3b8":"#fff",border:"none",borderRadius:7,cursor:a.test==="…"?"default":"pointer",fontSize:12,fontWeight:600}}>
+                    {a.test==="…"?"Testing…":"↻ Test key"}
+                  </button>
+                  <button onClick={a.onClear}
+                    style={{padding:"7px 12px",background:"transparent",border:"1px solid #e2e8f0",borderRadius:7,cursor:"pointer",fontSize:12,color:"#64748b"}}>
+                    Remove
+                  </button>
+                </div>
+                {a.test && a.test !== "…" && (
+                  <div style={{fontSize:11,marginTop:8,color:a.test.ok?"#065f46":"#b91c1c"}}>
+                    {a.test.ok ? "✓ The key works." : a.test.msg}
+                  </div>
+                )}
+              </div>
+            )}
+            <div style={{padding:"11px 13px",background:"#fffbeb",border:"1px solid #fde68a",borderRadius:8,fontSize:11,color:"#92400e",lineHeight:1.5,marginBottom:16}}>
+              The key is stored unencrypted in this device's browser storage. It is never synced to
+              OneDrive, never sent to the hub, and never written into a backup file — but any script
+              running on this page could read it. Use a key with a <strong>spend limit</strong> set in
+              the Anthropic Console, and revoke it if you lose the device.
+            </div>
 
             <div style={head}>Contexts</div>
             <div style={{border:"1px solid #e2e8f0",borderRadius:8,padding:"11px 13px",marginBottom:16}}>

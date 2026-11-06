@@ -15,12 +15,14 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="GTD">
 
-  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Exact versions with integrity: this page holds the Anthropic key and the OneDrive token.
+       Changing a version means changing it here and in static/sw.js, with its new hash. -->
+  <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1"></script>
+  <script src="https://unpkg.com/@babel/standalone@8.1.1/babel.min.js" crossorigin integrity="sha384-r5Ldzi45mT2cLBHDFFiSsTooTu4rFdkBdx9D50zWqSmJ8FLuJkQQTF7h6ERx/NX0"></script>
   <!-- Microsoft Authentication Library — used only for the OPTIONAL OneDrive cloud sync.
        Served from unpkg (same CDN as React) — Microsoft's own alcdn host is unreliable. -->
-  <script src="https://unpkg.com/@azure/msal-browser@2.38.4/lib/msal-browser.min.js"></script>
+  <script src="https://unpkg.com/@azure/msal-browser@2.38.4/lib/msal-browser.min.js" crossorigin integrity="sha384-FyFWjaUFP9q0tLEvcwV9UloGlRNkfP3l+vmNCjwLpji7ChADDrvdXXXNIufO0sEw"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { margin: 0; }
@@ -113,7 +115,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v37";
+    const APP_VERSION = "v38";
 
     // Default contexts — seed only. Since schema v2 the live list is state.contexts,
     // editable in-app (Sync & Backup → Contexts); this constant is the fallback/seed.
@@ -294,6 +296,15 @@
     // call with local first. A tombstone kills any copy older than the deletion,
     // so deletes propagate instead of resurrecting. Two devices editing DIFFERENT
     // items concurrently now both keep their changes (v1 whole-state LWW lost one).
+    // Finished sessions survive whichever copy wins. Crediting stamps nothing, so a device
+    // waking with a stale copy can't beat an edit made elsewhere while it slept. Days are
+    // sorted so two devices serialize alike and sync settles.
+    const withPomos = (winner, x, y) => {
+      if (!x.pomos && !y.pomos) return winner;
+      const days = { ...x.pomos };
+      Object.entries(y.pomos||{}).forEach(([d, c]) => { days[d] = Math.max(days[d]||0, c); });
+      return { ...winner, pomos: Object.fromEntries(Object.entries(days).sort()) };
+    };
     const mergeStates = (a, b) => {
       const A = migrate(a) || fresh(), B = migrate(b) || fresh();
       const index = s => { const m = new Map(); LISTS.forEach(l => (s[l]||[]).forEach(i => { if (!m.has(i.id)) m.set(i.id, { i, l }); })); return m; };
@@ -305,7 +316,7 @@
       const choose = id => {
         const ea = ia.get(id), eb = ib.get(id);
         const e  = !eb ? ea : !ea ? eb : ((eb.i._updatedAt||0) > (ea.i._updatedAt||0) ? eb : ea);
-        if (!(tombs[id] > (e.i._updatedAt||0))) out[e.l].push(e.i);
+        if (!(tombs[id] > (e.i._updatedAt||0))) out[e.l].push(ea && eb ? withPomos(e.i, ea.i, eb.i) : e.i);
       };
       LISTS.forEach(l => (A[l]||[]).forEach(i => { if (!seen.has(i.id)) { seen.add(i.id); choose(i.id); } }));
       LISTS.forEach(l => (B[l]||[]).forEach(i => { if (!seen.has(i.id)) { seen.add(i.id); choose(i.id); } }));
@@ -615,6 +626,26 @@
     const pomoTally = (state, from, to) => LISTS.flatMap(l => state[l]||[])
       .flatMap(i => Object.entries(i.pomos||{}))
       .reduce((n, [d, c]) => d >= from && d <= to ? n + c : n, 0);
+    // Item ids are floats, so they cross the bridge as strings and are compared as strings.
+    const applyWidgetOps = (state, ops, now, day) => {
+      let n = state;
+      ops.forEach(op => {
+        const id = op && op.id != null ? String(op.id) : "";
+        if (op.op === "capture" && (op.text||"").trim()) {
+          n = { ...n, inbox:[mk(op.text), ...n.inbox] };
+        } else if (op.op === "complete" && id) {
+          TODAY_LISTS.forEach(l => {
+            const it = (n[l]||[]).find(i => String(i.id) === id);
+            if (!it) return;
+            n = { ...n, [l]: n[l].filter(i => String(i.id) !== id), done:[{...it, doneAt:now}, ...n.done] };
+          });
+        } else if (op.op === "focus" && id && (n.next||[]).some(i => String(i.id) === id)) {
+          n = { ...n, next: n.next.map(i => String(i.id) === id
+            ? { ...i, focusDate: i.focusDate === day ? "" : day } : i) };
+        }
+      });
+      return n;
+    };
     // Every ring still ahead of this timer, for a native alarm that fires while the page
     // can't run. A session lists its break's end too: nothing will be awake to schedule it.
     const pomoAlarms = t => {
@@ -632,8 +663,11 @@
     // ── Storage: offline-first ────────────────────────────────────
     // localStorage is the source of truth on every device (instant, works with
     // no server). The Flask /api/state endpoint is an OPTIONAL sync hub used
-    // only when reachable (same PC / LAN / Tailscale). Reconciliation is
-    // last-write-wins on a state-level `_updatedAt` timestamp.
+    // only when reachable (same PC / LAN / Tailscale). Reconciliation is the item-level
+    // mergeStates.
+    // Only Flask serves the hub's routes. On Pages each call would fail, and only after
+    // sending the whole state there.
+    const HUB = !location.hostname.endsWith("github.io");
     const LS_KEY  = "gtd_state_v1";     // key name is historical; content is migrated to schema v2 on read
     const LS_ARCH = "gtd_archive_v1";
     const Store = {
@@ -652,6 +686,7 @@
         try { localStorage.setItem(LS_ARCH, JSON.stringify(a)); } catch {}
       },
       async _get(url, timeout=2000) {
+        if (!HUB) return null;
         try {
           const ctrl = new AbortController();
           const t = setTimeout(() => ctrl.abort(), timeout);
@@ -662,6 +697,7 @@
         } catch { return null; }
       },
       _post(url, d) {
+        if (!HUB) return;
         try {
           fetch(url, {
             method: "POST",
@@ -1336,6 +1372,7 @@
       // ── heartbeat — when served by Flask on the PC, lets the server exit
       //    once the browser closes. Harmless (and silently ignored) offline. ──
       useEffect(() => {
+        if (!HUB) return;
         const id = setInterval(() => fetch("api/ping", {method:"POST"}).catch(()=>{}), 5000);
         return () => clearInterval(id);
       }, []);
@@ -1381,9 +1418,30 @@
       const adopt = useCallback(merged => {
         const cur   = itemsRef.current || fresh();
         const final = mergeStates(cur, merged);
-        if (!sameState(final, cur)) setItems(final);
+        if (!sameState(final, cur)) {
+          setItems(final);
+          setHistory([]);   // an older snapshot would undo this incoming change on every device
+        }
         Store.saveLocal(final);
         return final;
+      }, []);
+
+      // Another tab wrote: take its changes so this tab's next save can't overwrite them.
+      // Not saved back: the tabs' list orders can differ, and each save fires the other's event.
+      useEffect(() => {
+        const onStorage = e => {
+          if (e.key !== LS_KEY || !e.newValue) return;
+          let theirs = null;
+          try { theirs = migrate(JSON.parse(e.newValue)); } catch {}
+          if (!theirs) return;
+          const cur = itemsRef.current || fresh(), final = mergeStates(cur, theirs);
+          if (sameState(final, cur)) return;
+          itemsRef.current = final;
+          setItems(final);
+          setHistory([]);
+        };
+        window.addEventListener("storage", onStorage);
+        return () => window.removeEventListener("storage", onStorage);
       }, []);
 
       // ── full reconcile with every reachable remote (Flask hub + OneDrive):
@@ -1527,7 +1585,7 @@
 
       // Polls localStorage rather than React state so two tabs share one timer: whichever
       // tab sees the expiry saves first and the other reads the advanced phase, so a
-      // session is credited once. Skips undo history: a timer firing isn't a user's action.
+      // session is credited once.
       const [pomo, setPomo] = useState(() => Pomo.load());
       const loaded = !!items;
       useEffect(() => {
@@ -1541,10 +1599,10 @@
             // the day it ended, not the day the page woke up to notice
             const live = itemsRef.current, next = pomoCredit(live, timer.itemId, isoDate(cur.endsAt));
             if (next !== live) {
-              const stamped = stampChanges(live, next);
-              itemsRef.current = stamped;
-              setItems(stamped);
-              persist(stamped);
+              itemsRef.current = next;
+              setItems(next);
+              setHistory([]);
+              persist(next);
             }
           }
           // a page waking long after the fact stays quiet: the moment to act has passed
@@ -1644,23 +1702,7 @@
         const ops = WidgetBridge.drain();
         if (!ops.length) return null;
         const cur = itemsRef.current || fresh();
-        const now = ts(), day = isoDate(new Date());
-        let n = cur;
-        ops.forEach(op => {
-          const id = op && op.id != null ? String(op.id) : "";
-          if (op.op === "capture" && (op.text||"").trim()) {
-            n = { ...n, inbox:[mk(op.text), ...n.inbox] };
-          } else if (op.op === "complete" && id) {
-            TODAY_LISTS.forEach(l => {
-              const it = (n[l]||[]).find(i => String(i.id) === id);
-              if (!it) return;
-              n = { ...n, [l]: n[l].filter(i => String(i.id) !== id), done:[{...it, doneAt:now}, ...n.done] };
-            });
-          } else if (op.op === "focus" && id) {
-            n = { ...n, next: (n.next||[]).map(i => String(i.id) === id
-              ? { ...i, focusDate: i.focusDate === day ? "" : day } : i) };
-          }
-        });
+        const n = applyWidgetOps(cur, ops, ts(), isoDate(new Date()));
         if (n === cur) return null;
         const stamped = stampChanges(cur, n);
         itemsRef.current = stamped;
@@ -2640,14 +2682,7 @@
               {displayTitle}
             </div>
             <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap"}}>
-              {item.context&&item.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{item.context}</Tag>}
-              {item.waitingFor&&<Tag bg="#fffbeb" c="#b45309">👤 {item.waitingFor}</Tag>}
-              {item.energy&&<Tag bg="#f1f5f9" c="#475569">🔋 {item.energy}</Tag>}
-              {item.time&&<Tag bg="#f1f5f9" c="#475569">⏱ {item.time}</Tag>}
-              {item.startDate&&<Tag bg="#eff6ff" c="#1d4ed8">🕒 {item.startDate}</Tag>}
-              {item.dueDate&&<Tag bg={ov?"#fef2f2":"#f0fdf4"} c={ov?"#b91c1c":"#166534"}>{ov?"⚠️ ":"📅 "}{dueLabel(item.dueDate,item.dueTime)}</Tag>}
-              <PomoTag item={item} open={list!=="done"}/>
-              {item.doneAt&&<Tag bg="#f0fdf4" c="#166534">✓ {fmtDate(item.doneAt)}</Tag>}
+              <ItemTags item={item} ov={ov}/>
             </div>
           </div>
           <div style={{display:"flex",gap:4,flexShrink:0,alignItems:"center"}}>
@@ -2747,13 +2782,7 @@
               <div style={{fontSize:13,fontWeight:500,wordBreak:"break-word"}}>{title}</div>
               <div style={{display:"flex",gap:5,marginTop:4,flexWrap:"wrap",alignItems:"center"}}>
                 <Tag bg="#eef2ff" c="#4338ca">{META[i._list].icon} {META[i._list].label}</Tag>
-                {i.context&&i.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{i.context}</Tag>}
-                {i.waitingFor&&<Tag bg="#fffbeb" c="#b45309">👤 {i.waitingFor}</Tag>}
-                {i.energy&&<Tag bg="#f1f5f9" c="#475569">🔋 {i.energy}</Tag>}
-                {i.time&&<Tag bg="#f1f5f9" c="#475569">⏱ {i.time}</Tag>}
-                {i.startDate&&<Tag bg="#eff6ff" c="#1d4ed8">🕒 {i.startDate}</Tag>}
-                {i.dueDate&&<Tag bg={ov?"#fef2f2":"#f0fdf4"} c={ov?"#b91c1c":"#166534"}>{ov?"⚠️ ":"📅 "}{dueLabel(i.dueDate,i.dueTime)}</Tag>}
-                <PomoTag item={i} open={true}/>
+                <ItemTags item={i} ov={ov}/>
               </div>
             </div>
             {i._list==="next" && onStartPomo && (
@@ -2864,10 +2893,25 @@
       );
     }
 
-    function PomoTag({ item, open }) {
+    function ItemTags({ item, ov }) {
+      return (
+        <React.Fragment>
+          {item.context&&item.context!=="@anywhere"&&<Tag bg="#ede9fe" c="#5b21b6">{item.context}</Tag>}
+          {item.waitingFor&&<Tag bg="#fffbeb" c="#b45309">👤 {item.waitingFor}</Tag>}
+          {item.energy&&<Tag bg="#f1f5f9" c="#475569">🔋 {item.energy}</Tag>}
+          {item.time&&<Tag bg="#f1f5f9" c="#475569">⏱ {item.time}</Tag>}
+          {item.startDate&&<Tag bg="#eff6ff" c="#1d4ed8">🕒 {item.startDate}</Tag>}
+          {item.dueDate&&<Tag bg={ov?"#fef2f2":"#f0fdf4"} c={ov?"#b91c1c":"#166534"}>{ov?"⚠️ ":"📅 "}{dueLabel(item.dueDate,item.dueTime)}</Tag>}
+          <PomoTag item={item}/>
+          {item.doneAt&&<Tag bg="#f0fdf4" c="#166534">✓ {fmtDate(item.doneAt)}</Tag>}
+        </React.Fragment>
+      );
+    }
+
+    function PomoTag({ item }) {
       const n = pomoTotal(item);
       if (!n) return null;
-      const big = open && n >= POMO_SPLIT;
+      const big = !item.doneAt && n >= POMO_SPLIT;
       return (
         <Tag bg={big?"#fffbeb":"#fef2f2"} c={big?"#b45309":"#b91c1c"}>
           🍅 {n}{big ? " · break it down?" : ""}

@@ -5,7 +5,7 @@
  * never intercepted — they hit the network when a server is reachable and are
  * simply allowed to fail offline (the app falls back to localStorage). */
 
-const CACHE = "gtd-v37";
+const CACHE = "gtd-v38";
 
 const SHELL = [
   "./",
@@ -14,9 +14,9 @@ const SHELL = [
   "static/icons/icon-192.png",
   "static/icons/icon-512.png",
   "static/icons/icon-maskable-512.png",
-  "https://unpkg.com/react@18/umd/react.production.min.js",
-  "https://unpkg.com/react-dom@18/umd/react-dom.production.min.js",
-  "https://unpkg.com/@babel/standalone/babel.min.js",
+  "https://unpkg.com/react@18.3.1/umd/react.production.min.js",
+  "https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js",
+  "https://unpkg.com/@babel/standalone@8.1.1/babel.min.js",
   "https://unpkg.com/@azure/msal-browser@2.38.4/lib/msal-browser.min.js",
 ];
 

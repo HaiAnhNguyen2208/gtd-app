@@ -5,7 +5,7 @@
  * never intercepted — they hit the network when a server is reachable and are
  * simply allowed to fail offline (the app falls back to localStorage). */
 
-const CACHE = "gtd-v36";
+const CACHE = "gtd-v37";
 
 const SHELL = [
   "./",
@@ -34,6 +34,14 @@ self.addEventListener("activate", (e) => {
     const keys = await caches.keys();
     await Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)));
     await self.clients.claim();
+  })());
+});
+
+self.addEventListener("notificationclick", (e) => {
+  e.notification.close();
+  e.waitUntil((async () => {
+    const [win] = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    return win ? win.focus() : self.clients.openWindow("./");
   })());
 });
 

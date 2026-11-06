@@ -113,7 +113,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v36";
+    const APP_VERSION = "v37";
 
     // Default contexts — seed only. Since schema v2 the live list is state.contexts,
     // editable in-app (Sync & Backup → Contexts); this constant is the fallback/seed.
@@ -572,6 +572,61 @@
       const applied = results.filter(r => r.ok).length;
       return { state: n, results, applied, skipped: results.length - applied };
     };
+
+    // ── Pomodoro ──────────────────────────────────────────────────
+    // Phases: work → break → idle (a new session is always started by hand). `endsAt` is
+    // absolute, so a throttled or suspended page catches up correctly when it wakes.
+    // The timer is device-local; only finished sessions (item.pomos, {day: count}) go
+    // through sync. A session is indivisible: there is no pause or task switch, stopping
+    // voids it, and completing the action mid-session doesn't end it.
+    const POMO_MIN = { work:25, short:5, long:15 };
+    const POMO_LONG_EVERY = 4;
+    const POMO_SPLIT = 5;     // this many sessions on one action: it's really a project
+    const POMO_MSG = { work:"Pomodoro done — take a break.", break:"Break over." };
+    const pomoBreakMs = done => (done % POMO_LONG_EVERY === 0 ? POMO_MIN.long : POMO_MIN.short) * 60000;
+    const pomoStart = (cur, item, now) => ({
+      phase:"work", itemId: item ? item.id : null, title: item ? (item.title||"") : "",
+      done: cur ? cur.done : 0, marks:0, endsAt: now + POMO_MIN.work*60000,
+    });
+    // Same object back when nothing expired. Breaks run from the session's end, not from
+    // `now`, so coming back after hours lands on idle rather than on a fresh break.
+    const pomoTick = (cur, now) => {
+      let timer = cur, credited = false, finished = null;
+      if (timer && timer.phase === "work" && timer.endsAt <= now) {
+        const done = timer.done + 1;
+        timer = { ...timer, phase:"break", done, endsAt: timer.endsAt + pomoBreakMs(done) };
+        credited = true; finished = "work";
+      }
+      if (timer && timer.phase === "break" && timer.endsAt <= now) {
+        timer = { ...timer, phase:"idle", endsAt:0 };
+        finished = finished || "break";
+      }
+      return { timer, credited, finished };
+    };
+    // Searches every list: the action may have been completed or moved mid-session.
+    const pomoCredit = (state, id, day) => {
+      const l = id == null ? null : LISTS.find(k => (state[k]||[]).some(i => i.id === id));
+      if (!l) return state;
+      const bump = i => ({ ...i, pomos:{ ...i.pomos, [day]:((i.pomos||{})[day]||0)+1 } });
+      return { ...state, [l]: state[l].map(i => i.id === id ? bump(i) : i) };
+    };
+    const pomoTotal = i => Object.values((i && i.pomos) || {}).reduce((n, c) => n + c, 0);
+    // Sessions credited to any action between two ISO days, inclusive.
+    const pomoTally = (state, from, to) => LISTS.flatMap(l => state[l]||[])
+      .flatMap(i => Object.entries(i.pomos||{}))
+      .reduce((n, [d, c]) => d >= from && d <= to ? n + c : n, 0);
+    // Every ring still ahead of this timer, for a native alarm that fires while the page
+    // can't run. A session lists its break's end too: nothing will be awake to schedule it.
+    const pomoAlarms = t => {
+      if (!t || !t.endsAt) return [];
+      if (t.phase === "break") return [{ at:t.endsAt, body:POMO_MSG.break }];
+      return [{ at:t.endsAt, body:POMO_MSG.work },
+              { at:t.endsAt + pomoBreakMs(t.done+1), body:POMO_MSG.break }];
+    };
+    const pomoClock = ms => {
+      const s = Math.max(0, Math.ceil(ms/1000));
+      return `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+    };
     // ═══ END DATA CORE ═══════════════════════════════════════════
 
     // ── Storage: offline-first ────────────────────────────────────
@@ -812,6 +867,47 @@
       },
       // lets HeadlessSyncWorker tear its offscreen WebView down as soon as we're synced
       ready() { if (this.available()) { try { AndroidWidget.notifyReady(); } catch {} } },
+    };
+
+    // ── Pomodoro adapter — device-local timer + end-of-phase alert ───────────
+    // The Android wrapper rings through a native alarm (AndroidWidget.setPomoAlarms); an
+    // older APK without that method simply gets the in-app alert when it's next opened.
+    // shortcut: a hidden browser tab's timers are throttled, so its alert can be up to a minute late; Web Push would fix that but needs a server.
+    const POMO_LS = "gtd_pomo_v1";
+    const Pomo = {
+      load() { try { return JSON.parse(localStorage.getItem(POMO_LS)); } catch { return null; } },
+      save(t) {
+        try { t ? localStorage.setItem(POMO_LS, JSON.stringify(t)) : localStorage.removeItem(POMO_LS); } catch {}
+        try { if (WidgetBridge.available() && AndroidWidget.setPomoAlarms) AndroidWidget.setPomoAlarms(JSON.stringify(pomoAlarms(t))); } catch {}
+      },
+      _ctx: null,
+      _audio() {
+        if (!this._ctx) this._ctx = new (window.AudioContext||window.webkitAudioContext)();
+        this._ctx.resume();
+        return this._ctx;
+      },
+      // call from a click: browsers only unlock sound and allow the permission prompt on a gesture
+      arm() {
+        try { this._audio(); } catch {}
+        try { if (window.Notification && Notification.permission === "default") Notification.requestPermission(); } catch {}
+      },
+      alert(body) {
+        try {
+          const a = this._audio();
+          [0,.3,.6].forEach(d => {
+            const o = a.createOscillator(), g = a.createGain();
+            o.frequency.value = 880; g.gain.value = .2;
+            o.connect(g).connect(a.destination);
+            o.start(a.currentTime+d); o.stop(a.currentTime+d+.15);
+          });
+        } catch {}
+        try { navigator.vibrate && navigator.vibrate([200,100,200]); } catch {}
+        try {
+          // via the service worker: `new Notification()` throws on Android Chrome
+          if (window.Notification && Notification.permission === "granted")
+            navigator.serviceWorker.ready.then(r => r.showNotification("GTD", { body, tag:"gtd-pomo", icon:"static/icons/icon-192.png" })).catch(()=>{});
+        } catch {}
+      },
     };
 
     // ── Claude (Anthropic Messages API) — optional, browser-direct ───────────
@@ -1429,6 +1525,54 @@
         persist(stamped);
       }, [items, persist]);
 
+      // Polls localStorage rather than React state so two tabs share one timer: whichever
+      // tab sees the expiry saves first and the other reads the advanced phase, so a
+      // session is credited once. Skips undo history: a timer firing isn't a user's action.
+      const [pomo, setPomo] = useState(() => Pomo.load());
+      const loaded = !!items;
+      useEffect(() => {
+        if (!loaded || LAUNCH.headless) return;
+        const baseTitle = document.title;
+        const tick = () => {
+          const cur = Pomo.load(), now = Date.now();
+          const { timer, credited, finished } = pomoTick(cur, now);
+          if (timer !== cur) Pomo.save(timer);
+          if (credited) {
+            // the day it ended, not the day the page woke up to notice
+            const live = itemsRef.current, next = pomoCredit(live, timer.itemId, isoDate(cur.endsAt));
+            if (next !== live) {
+              const stamped = stampChanges(live, next);
+              itemsRef.current = stamped;
+              setItems(stamped);
+              persist(stamped);
+            }
+          }
+          // a page waking long after the fact stays quiet: the moment to act has passed
+          if (finished && now - cur.endsAt < 120000) Pomo.alert(POMO_MSG[finished]);
+          setPomo(p => sameState(p, timer) ? p : timer);
+          document.title = timer && timer.endsAt ? `${pomoClock(timer.endsAt-now)} ${timer.phase==="work"?"🍅":"☕"} ${baseTitle}` : baseTitle;
+        };
+        tick();
+        const id = setInterval(tick, 1000);
+        return () => { clearInterval(id); document.title = baseTitle; };
+      }, [loaded, persist]);
+      const savePomo  = t => { Pomo.save(t); setPomo(t); };
+      const startPomo = item => { Pomo.arm(); savePomo(pomoStart(Pomo.load(), item, Date.now())); };
+      // A session is indivisible, so while one runs nothing offers to start another.
+      const canStartPomo = !pomo || pomo.phase !== "work";
+      // A thought that arrives mid-session goes to the Inbox and the session carries on;
+      // the mark keeps visible how often the mind tried to leave.
+      const captureThought = t => {
+        upd({ ...items, inbox:[mk(t), ...items.inbox] });
+        const cur = Pomo.load();
+        if (cur && cur.phase === "work") savePomo({ ...cur, marks:(cur.marks||0)+1 });
+      };
+      const renderPomoBar = onCapture => (
+        <PomoBar pomo={pomo} onStop={()=>savePomo(null)} onCapture={onCapture}
+          onSkip={()=>savePomo({ ...pomo, phase:"idle", endsAt:0 })}
+          onNext={()=>startPomo({ id:pomo.itemId, title:pomo.title })}/>
+      );
+
       // One job at a time: {kind, target, busy, error, data, refs}. Clarify, breakdown
       // and the review coach all run through here so there is one place that reads the
       // live state, one abort, and one error surface.
@@ -1606,7 +1750,7 @@
       // ── actions ──
       const quickCapture = () => {
         if (!capture.trim()) return;
-        upd({ ...items, inbox:[mk(capture), ...items.inbox] });
+        captureThought(capture);
         setCapture("");
       };
 
@@ -1736,10 +1880,11 @@
           <FloatToday items={items} todayISO={today} pnameOf={i=>(i&&i.projectId&&pm.get(i.projectId))||null}
             onComplete={(list,it)=>confirmComplete(list,it.id,"later",null)}
             onToggleFocus={toggleFocus}
-            onCapture={t=>upd({ ...items, inbox:[mk(t), ...items.inbox] })}
+            onCapture={captureThought}
+            onStartPomo={canStartPomo ? startPomo : null} pomoBar={renderPomoBar(null)}
             onClose={closePip}/>
         );
-      }, [pipOn, items]);
+      }, [pipOn, items, pomo]);
 
       // `?float=1` — the laptop widget shortcut. Document-PiP requires a user gesture,
       // so the automatic attempt is usually refused; when it is we fall back to a bare
@@ -1910,6 +2055,10 @@
                 {history.length > 0 && (
                   <button onClick={undo} title="Undo (Ctrl+Z)" className="btn btn-ghost btn-sm">↩ Undo</button>
                 )}
+                {canStartPomo && active!=="today" && (
+                  <button onClick={()=>startPomo({ id:null, title:active==="next"&&ctx!=="all" ? `Batch ${ctx}` : META[active].label })}
+                    title="Start a pomodoro on this view — clear the Inbox, run the review, or batch small actions in one context" aria-label="Start a pomodoro on this view" className="btn btn-ghost btn-sm">🍅</button>
+                )}
                 {pipSupported && (
                   <button onClick={pipOn?closePip:openPip} title={pipOn?"Close the floating window":"Pop out a floating, always-on-top Today window"}
                     className={"btn btn-sm "+(pipOn?"btn-pri":"btn-ghost")}>⤢ {pipOn?"Floating":"Float"}</button>
@@ -1919,6 +2068,8 @@
                 )}
               </div>
             </div>
+
+            {renderPomoBar(captureThought)}
 
             {active==="next" && (
               <div style={{padding:"8px 22px",background:"#fff",borderBottom:"1px solid var(--line)",display:"flex",gap:6,flexWrap:"wrap",alignItems:"center",flexShrink:0}}>
@@ -2001,7 +2152,7 @@
               {active==="today" ? (
                 <TodayView items={items} todayISO={todayISO} pnameOf={pnameOf} reviewDue={reviewDue} daysSinceReview={daysSinceReview}
                   onComplete={(list,item)=>setComplCand({list,item})}
-                  onToggleFocus={toggleFocus}
+                  onToggleFocus={toggleFocus} onStartPomo={canStartPomo ? startPomo : null}
                   onEdit={(list,item)=>setEditCand({list,item})}
                   onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}/>
               ) : active==="calendar" ? (
@@ -2053,6 +2204,7 @@
                       onEdit={["next","waiting","someday","reference"].includes(active) ? ()=>setEditCand({list:active,item}) : null}
                       onToggleFocus={active==="next" ? ()=>toggleFocus(item.id) : null}
                       focused={active==="next" && item.focusDate===todayISO}
+                      onStartPomo={active==="next" && canStartPomo ? ()=>startPomo(item) : null}
                       currentList={active}/>
                   ))}
                   {deferredShown.length>0 && (
@@ -2428,7 +2580,7 @@
     }
 
     // ── ItemCard ──────────────────────────────────────────────────
-    function ItemCard({ item, list, pname, onComplete, onDelete, onProcess, onRestore, onMove, onPromote, onToggleFocus, onEdit, focused, currentList }) {
+    function ItemCard({ item, list, pname, onComplete, onDelete, onProcess, onRestore, onMove, onPromote, onToggleFocus, onStartPomo, onEdit, focused, currentList }) {
       const [menuPos, setMenuPos] = useState(null);   // {top|bottom, right} in viewport coords, or null = closed
       const moveRef = React.useRef(null);
       const btnRef  = React.useRef(null);
@@ -2494,10 +2646,12 @@
               {item.time&&<Tag bg="#f1f5f9" c="#475569">⏱ {item.time}</Tag>}
               {item.startDate&&<Tag bg="#eff6ff" c="#1d4ed8">🕒 {item.startDate}</Tag>}
               {item.dueDate&&<Tag bg={ov?"#fef2f2":"#f0fdf4"} c={ov?"#b91c1c":"#166534"}>{ov?"⚠️ ":"📅 "}{dueLabel(item.dueDate,item.dueTime)}</Tag>}
+              <PomoTag item={item} open={list!=="done"}/>
               {item.doneAt&&<Tag bg="#f0fdf4" c="#166534">✓ {fmtDate(item.doneAt)}</Tag>}
             </div>
           </div>
           <div style={{display:"flex",gap:4,flexShrink:0,alignItems:"center"}}>
+            {onStartPomo&&<button onClick={onStartPomo} title="Start a pomodoro" aria-label="Start a pomodoro" className="ibtn" style={{fontSize:13}}>🍅</button>}
             {onProcess&&<button onClick={onProcess} style={{padding:"3px 8px",background:"#6366f1",color:"#fff",border:"none",borderRadius:5,cursor:"pointer",fontSize:10,fontWeight:700}}>Process</button>}
             {onRestore&&<button onClick={onRestore} style={{padding:"3px 8px",background:"#f1f5f9",color:"#475569",border:"1px solid #e2e8f0",borderRadius:5,cursor:"pointer",fontSize:10}}>Restore</button>}
             {onToggleFocus&&(
@@ -2562,7 +2716,7 @@
     // "Focused today" = Next Actions you starred for today (ephemeral focusDate);
     // "Due today"/"Overdue" = the hard landscape (any dated list). Unfinished focus
     // simply isn't "today" tomorrow — it stays in Next Actions, no rollover guilt.
-    function TodayView({ items, todayISO, pnameOf, reviewDue, daysSinceReview, onComplete, onToggleFocus, onGoto, onEdit }) {
+    function TodayView({ items, todayISO, pnameOf, reviewDue, daysSinceReview, onComplete, onToggleFocus, onStartPomo, onGoto, onEdit }) {
       const dateLabel = new Date(todayISO+"T00:00").toLocaleDateString("en-US",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
       const [hideReview, setHideReview] = useState(false);
 
@@ -2573,6 +2727,8 @@
       const due     = rows.filter(r=>r._kind==="due");
       const started = rows.filter(r=>r._kind==="started");
       const total   = rows.length;
+      const yesterday = isoDate(new Date(todayISO+"T12:00").getTime()-86400000);
+      const pomoToday = pomoTally(items, todayISO, todayISO), pomoYday = pomoTally(items, yesterday, yesterday);
 
       const Row = ({ i, ov }) => {
         const pname = pnameOf(i);
@@ -2597,8 +2753,12 @@
                 {i.time&&<Tag bg="#f1f5f9" c="#475569">⏱ {i.time}</Tag>}
                 {i.startDate&&<Tag bg="#eff6ff" c="#1d4ed8">🕒 {i.startDate}</Tag>}
                 {i.dueDate&&<Tag bg={ov?"#fef2f2":"#f0fdf4"} c={ov?"#b91c1c":"#166534"}>{ov?"⚠️ ":"📅 "}{dueLabel(i.dueDate,i.dueTime)}</Tag>}
+                <PomoTag item={i} open={true}/>
               </div>
             </div>
+            {i._list==="next" && onStartPomo && (
+              <button onClick={()=>onStartPomo(i)} title="Start a pomodoro" aria-label="Start a pomodoro" className="ibtn" style={{fontSize:13,flexShrink:0}}>🍅</button>
+            )}
             {i._list==="next" && onToggleFocus && (
               <button onClick={()=>onToggleFocus(i.id)} title={foc?"Remove from today's focus":"Focus for today"}
                 style={{background:"none",border:"none",cursor:"pointer",color:foc?"#f59e0b":"#cbd5e1",fontSize:15,lineHeight:1,padding:"0 1px",flexShrink:0}}>
@@ -2643,7 +2803,10 @@
           )}
           <div style={{display:"flex",alignItems:"baseline",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:6}}>
             <div style={{fontSize:15,fontWeight:700}}>{dateLabel}</div>
-            <div style={{fontSize:11,color:"#64748b"}}>{total} {total===1?"item":"items"} on deck</div>
+            <div style={{fontSize:11,color:"#64748b"}}>
+              {total} {total===1?"item":"items"} on deck
+              {(pomoToday>0||pomoYday>0) && <span title="Finished sessions on actions. Yesterday's number is the honest guide to how much fits today."> · 🍅 {pomoToday} today · {pomoYday} yesterday</span>}
+            </div>
           </div>
           {total===0 ? (
             <div style={{textAlign:"center",padding:"48px 20px",color:"#94a3b8"}}>
@@ -2667,12 +2830,57 @@
       );
     }
 
+    // ── PomoBar ───────────────────────────────────────────────────
+    // Owns its one-second clock so a running timer re-renders this strip, not the whole App.
+    function PomoBar({ pomo, onStop, onSkip, onNext, onCapture }) {
+      const [, setNow] = useState(0);
+      const [thought, setThought] = useState("");
+      const fire = () => { const t = thought.trim(); if (!t) return; onCapture(t); setThought(""); };
+      useEffect(() => {
+        const id = setInterval(() => setNow(Date.now()), 1000);
+        return () => clearInterval(id);
+      }, []);
+      if (!pomo) return null;
+      const look = { work:["#fef2f2","#b91c1c","🍅"], break:["#f0fdf4","#166534","☕"], idle:["#f1f5f9","#475569","🍅"] }[pomo.phase];
+      return (
+        <div role="timer" style={{display:"flex",flexWrap:"wrap",alignItems:"center",gap:"6px 10px",padding:"8px 14px",background:look[0],color:look[1],borderBottom:"1px solid #e2e8f0",flexShrink:0}}>
+          <span style={{fontSize:15,fontWeight:700,fontVariantNumeric:"tabular-nums",whiteSpace:"nowrap"}}>
+            {look[2]} {pomo.phase==="idle" ? "Break over" : pomoClock(pomo.endsAt-Date.now())}
+          </span>
+          <span style={{flex:"1 1 90px",minWidth:0,fontSize:12,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
+            {pomo.phase==="break" ? "Break — step away" : pomo.title}
+          </span>
+          {pomo.done>0 && <span title="Sessions finished in this run" style={{fontSize:11,fontWeight:600,whiteSpace:"nowrap"}}>× {pomo.done}</span>}
+          {pomo.phase==="work" && pomo.marks>0 && <span title="Thoughts captured during this session" style={{fontSize:11,fontWeight:600,whiteSpace:"nowrap"}}>’ {pomo.marks}</span>}
+          {pomo.phase==="break" && <button onClick={onSkip} className="btn btn-ghost btn-sm">Skip</button>}
+          {pomo.phase==="idle"  && <button onClick={onNext} className="btn btn-pri btn-sm">▶ Next</button>}
+          <button onClick={onStop} title="Stop (an unfinished session isn't counted)" aria-label="Stop timer" className="ibtn" style={{fontSize:15}}>×</button>
+          {onCapture && pomo.phase==="work" && (
+            <input value={thought} onChange={e=>setThought(e.target.value)} onKeyDown={e=>e.key==="Enter"&&fire()}
+              placeholder="Something on your mind? Enter sends it to the Inbox — keep going." aria-label="Capture to Inbox"
+              className="in in-sm" style={{flex:"1 1 100%",minWidth:0}}/>
+          )}
+        </div>
+      );
+    }
+
+    function PomoTag({ item, open }) {
+      const n = pomoTotal(item);
+      if (!n) return null;
+      const big = open && n >= POMO_SPLIT;
+      return (
+        <Tag bg={big?"#fffbeb":"#fef2f2"} c={big?"#b45309":"#b91c1c"}>
+          🍅 {n}{big ? " · break it down?" : ""}
+        </Tag>
+      );
+    }
+
     // ── FloatToday ────────────────────────────────────────────────
     // Compact companion rendered into a Document Picture-in-Picture window (see
     // App.openPip): an always-on-top floating panel to glance at today and capture
     // into the Inbox while working in other apps. Self-contained — every mutation is
     // passed in as a prop (it shares no React context with the main tree).
-    function FloatToday({ items, todayISO, pnameOf, onComplete, onToggleFocus, onCapture, onClose }) {
+    function FloatToday({ items, todayISO, pnameOf, onComplete, onToggleFocus, onStartPomo, pomoBar, onCapture, onClose }) {
       const [tab, setTab]   = useState("today");
       const [text, setText] = useState("");
       const fire = () => { const t=text.trim(); if(!t) return; onCapture(t); setText(""); };
@@ -2691,6 +2899,8 @@
             <button onClick={onClose} title="Close floating window"
               style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:17,lineHeight:1,padding:0}}>×</button>
           </div>
+
+          {pomoBar}
 
           {/* quick capture → Inbox */}
           <div style={{display:"flex",gap:6,padding:"10px 12px",background:"#fff",borderBottom:"1px solid #e2e8f0",flexShrink:0}}>
@@ -2729,6 +2939,10 @@
                         {i.dueDate&&` · ${dueLabel(i.dueDate,i.dueTime)}`}
                       </div>
                     </div>
+                    {i._list==="next"&&onStartPomo&&(
+                      <button onClick={()=>onStartPomo(i)} title="Start a pomodoro" aria-label="Start a pomodoro"
+                        style={{background:"none",border:"none",cursor:"pointer",fontSize:13,lineHeight:1,padding:0,flexShrink:0}}>🍅</button>
+                    )}
                     {i._list==="next"&&(
                       <button onClick={()=>onToggleFocus(i.id)} title={foc?"Unfocus":"Focus for today"}
                         style={{background:"none",border:"none",cursor:"pointer",color:foc?"#f59e0b":"#cbd5e1",fontSize:14,lineHeight:1,padding:0,flexShrink:0}}>{foc?"★":"☆"}</button>
@@ -2954,6 +3168,7 @@
           {k:"creative", label:"Add new ideas & projects", hint:"What's possible now? Capture anything fresh that surfaced."},
         ]},
       ];
+      const pomoWeek = pomoTally(items, isoDate(new Date(todayISO+"T12:00").getTime()-6*86400000), todayISO);
       // The app has already COUNTED everything; the coach is handed those numbers so
       // it spends its turn on judgement instead of re-deriving what we know exactly.
       const facts = [
@@ -2961,6 +3176,7 @@
         `projects: ${projects.length} (${stalled.length} stalled: ${stalled.map(p=>p.title).join("; ") || "none"})`,
         `someday: ${someC}`, `dated: ${overdue} overdue, ${upcoming} upcoming`,
         `weekly review: ${daysSinceReview===null ? "never run" : daysSinceReview + " days since the last one"}`,
+        `pomodoros in the last 7 days: ${pomoWeek}`,
       ].join("\n");
       const obsFor = key => ((ai && ai.data && ai.data.observations) || []).filter(o => o.phase === key);
 
@@ -2982,6 +3198,7 @@
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginBottom:14}}>
             <div style={{fontSize:12,color:"#64748b"}}>
               The habit that keeps your system trustworthy. Walk each step, then mark it complete.
+              {pomoWeek>0 && ` 🍅 ${pomoWeek} focused sessions in the last 7 days.`}
             </div>
             {onSetReviewDay && (
               <label style={{display:"flex",alignItems:"center",gap:6,fontSize:11,color:"#64748b",whiteSpace:"nowrap"}}>

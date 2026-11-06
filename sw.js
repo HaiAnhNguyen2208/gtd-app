@@ -1,14 +1,15 @@
 /* GTD service worker — makes the app installable and fully usable offline.
  *
- * App shell (HTML + CDN React/Babel + icons) is precached on install and
- * served cache-first. The /api/* endpoints are the OPTIONAL sync hub and are
- * never intercepted — they hit the network when a server is reachable and are
- * simply allowed to fail offline (the app falls back to localStorage). */
+ * App shell (HTML, scripts, CDN React + icons) is precached on install and
+ * served cache-first. */
 
-const CACHE = "gtd-v44";
+const CACHE = "gtd-v45";
 
 const SHELL = [
   "./",
+  "core.js",
+  "adapters.js",
+  "app.js",
   "manifest.webmanifest",
   "static/icons/icon.svg",
   "static/icons/icon-192.png",
@@ -16,7 +17,6 @@ const SHELL = [
   "static/icons/icon-maskable-512.png",
   "https://unpkg.com/react@18.3.1/umd/react.production.min.js",
   "https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js",
-  "https://unpkg.com/@babel/standalone@8.1.1/babel.min.js",
   "https://unpkg.com/@azure/msal-browser@2.38.4/lib/msal-browser.min.js",
 ];
 
@@ -47,10 +47,9 @@ self.addEventListener("notificationclick", (e) => {
 
 self.addEventListener("fetch", (e) => {
   const req = e.request;
-  if (req.method !== "GET") return;                       // POST /api/state etc. → straight to network
+  if (req.method !== "GET") return;
 
   const url = new URL(req.url);
-  if (url.pathname.endsWith("/api/state") || url.pathname.endsWith("/api/archive") || url.pathname.endsWith("/api/ping")) return;
   // OneDrive auth + data, and the Anthropic API, must always hit the network —
   // never cache or intercept. (Claude calls are POST, so the guard above already lets
   // them through; this keeps the intent explicit and covers any future GET.)

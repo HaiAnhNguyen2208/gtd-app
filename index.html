@@ -72,6 +72,7 @@
     .in{ width:100%; padding:8px 10px; border:1px solid var(--line-2); border-radius:8px;
          font-size:13px; outline:none; background:#fff; color:var(--ink); font-family:inherit; }
     .in:focus{ border-color:var(--indigo); }
+    .agent-box:focus-within{ border-color:var(--indigo) !important; }
     .in-sm{ padding:7px 9px; font-size:12px; border-radius:7px; }
     select.in{ cursor:pointer; }
     /* stacked label + control */
@@ -115,7 +116,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v39";
+    const APP_VERSION = "v40";
 
     // Default contexts — seed only. Since schema v2 the live list is state.contexts,
     // editable in-app (Sync & Backup → Contexts); this constant is the fallback/seed.
@@ -988,7 +989,7 @@
         try {
           // via the service worker: `new Notification()` throws on Android Chrome
           if (window.Notification && Notification.permission === "granted")
-            navigator.serviceWorker.ready.then(r => r.showNotification("GTD", { body, tag:"gtd-pomo", icon:"static/icons/icon-192.png" })).catch(()=>{});
+            navigator.serviceWorker.ready.then(r => r.showNotification("GTD", { body, tag:"gtd-pomo", renotify:true, icon:"static/icons/icon-192.png" })).catch(()=>{});
         } catch {}
       },
     };
@@ -1686,6 +1687,7 @@
         const cur = Pomo.load();
         if (cur && cur.phase === "work") savePomo({ ...cur, marks:(cur.marks||0)+1 });
       };
+      const agent = useAgentSession(items, archive, pomo);
       const renderPomoBar = onCapture => (
         <PomoBar pomo={pomo} compact={!onCapture} onStop={()=>savePomo(null)} onCapture={onCapture}
           onSkip={()=>savePomo({ ...pomo, phase:"idle", endsAt:0 })}
@@ -1951,6 +1953,26 @@
       // React root (separate document — so React's event delegation actually fires
       // there); App re-renders it via the effect below whenever `items` change.
       const pipSupported = typeof window!=="undefined" && "documentPictureInPicture" in window;
+      const renderChat = compact => (
+        <ChatView compact={compact} agent={agent} items={items} todayISO={isoDate(new Date())} onApply={applyAi}
+          onSaveContext={text=>upd({ ...itemsRef.current, agentContext:text })}/>
+      );
+      const renderReview = onGoto => {
+        const at = items._reviewedAt || 0;
+        return (
+          <WeeklyReview items={items} todayISO={isoDate(new Date())} reviewedAt={at}
+            daysSinceReview={at ? Math.floor((Date.now()-at)/86400000) : null}
+            reviewDay={items._reviewDay==null ? 6 : items._reviewDay} onSetReviewDay={d=>upd({ ...items, _reviewDay:d })}
+            onComplete={()=>upd({ ...items, _reviewedAt:Date.now() })} onGoto={onGoto}
+            ai={aiOn ? { ...aiPanel("review"), onRun: facts => runAi("review", facts) } : null}/>
+        );
+      };
+      // A reload closes the float, and only a click can reopen it, so ?float=1 lands on the one-click launcher.
+      const reloadApp = () => {
+        if (!pipWinRef.current) { window.location.reload(); return; }
+        window.focus();
+        window.location.assign("?float=1");
+      };
       const closePip = () => {
         try { pipRootRef.current && pipRootRef.current.unmount(); } catch(e){}
         pipRootRef.current = null;
@@ -1969,6 +1991,8 @@
         w.document.title = "GTD";
         Object.assign(w.document.body.style, { margin:"0", fontFamily:"'Inter',system-ui,sans-serif", background:"#f1f5f9", color:"#1e293b" });
         w.addEventListener("pagehide", closePip);   // user closed the float window
+        // With the main window out of sight, using the float is the moment to look for a new build.
+        w.addEventListener("focus", () => { if ("serviceWorker" in navigator) navigator.serviceWorker.getRegistration().then(r => r && r.update()).catch(() => {}); });
         pipWinRef.current  = w;
         pipRootRef.current = ReactDOM.createRoot(w.document.body);
         setPipOn(true);
@@ -1987,9 +2011,17 @@
             onOpen={v=>{ setActive(v); setCtx("all"); setShowForm(false); window.focus(); }}
             onCapture={captureThought}
             onStartPomo={canStartPomo ? startPomo : null} pomoBar={renderPomoBar(null)}
+            updateReady={updateReady} onReload={reloadApp}
+            renderView={(v, onGoto) => v==="chat" ? renderChat(true)
+              : v==="review" ? renderReview(onGoto)
+              : v==="calendar" ? (
+                <CalendarView compact items={items} pnameOf={i=>(i&&i.projectId&&pm.get(i.projectId))||null}
+                  onComplete={(list,it)=>confirmComplete(list,it.id,"later",null)}
+                  onEdit={(list,item)=>{ setEditCand({list,item}); window.focus(); }} onGoto={onGoto}/>
+              ) : null}
             onClose={closePip}/>
         );
-      }, [pipOn, items, pomo, history]);
+      }, [pipOn, items, pomo, history, archive, updateReady, aiOn, aiJob, agent.msgs, agent.busy, agent.step, agent.error, agent.cost, agent.proposal]);
 
       // `?float=1` — the laptop widget shortcut. Document-PiP requires a user gesture,
       // so the automatic attempt is usually refused; when it is we fall back to a bare
@@ -2022,7 +2054,7 @@
       if (floatWanted) return (
         <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:12,height:"100vh"}}>
           <div style={{fontSize:34}}>🎯</div>
-          <button onClick={openPip} className="btn btn-pri">⤢ Open floating Today</button>
+          <button onClick={openPip} className="btn btn-pri">⤢ Open the float</button>
           <button onClick={()=>setFloatWanted(false)} className="btn btn-ghost btn-sm">Open the full app instead</button>
         </div>
       );
@@ -2069,8 +2101,6 @@
         return d.getTime();
       })();
       const reviewDue       = reviewedAt < reviewWindowStart;     // not reviewed since this week's review day
-      const markReviewed    = () => upd({ ...items, _reviewedAt: Date.now() });
-      const setReviewDay    = d => upd({ ...items, _reviewDay: d });
 
       // cloud sync status (syncTick forces this to re-evaluate after each sync)
       void syncTick;
@@ -2266,14 +2296,9 @@
                   onEdit={(list,item)=>setEditCand({list,item})}
                   onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}/>
               ) : active==="chat" ? (
-                <ChatView items={items} archive={archive} todayISO={todayISO} pomo={pomo} onApply={applyAi}
-                  onSaveContext={text=>upd({ ...itemsRef.current, agentContext:text })}/>
+                renderChat(false)
               ) : active==="review" ? (
-                <WeeklyReview items={items} todayISO={todayISO} reviewedAt={reviewedAt} daysSinceReview={daysSinceReview}
-                  reviewDay={reviewDay} onSetReviewDay={setReviewDay}
-                  onComplete={markReviewed}
-                  onGoto={list=>{setActive(list);setCtx("all");setNavOpen(false);}}
-                  ai={aiOn ? { ...aiPanel("review"), onRun: facts => runAi("review", facts) } : null}/>
+                renderReview(list=>{setActive(list);setCtx("all");setNavOpen(false);})
               ) : active==="projects" ? (
                 shown.length===0
                   ? <EmptyState list="projects"/>
@@ -2416,7 +2441,7 @@
                          display:"flex",alignItems:"center",gap:12,padding:"10px 14px",background:"#1e293b",color:"#f1f5f9",
                          borderRadius:10,boxShadow:"0 10px 30px rgba(0,0,0,.3)",fontSize:12,maxWidth:"92vw"}}>
               <span>🔄 A new version is ready.</span>
-              <button onClick={()=>window.location.reload()}
+              <button onClick={reloadApp}
                 style={{padding:"5px 12px",background:"#6366f1",color:"#fff",border:"none",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:700}}>
                 Reload
               </button>
@@ -2934,6 +2959,8 @@
         return () => clearInterval(id);
       }, []);
       if (!pomo) return null;
+      // Android rings natively (its WebView has no Notification), so only a browser can be missing this.
+      const notif = window.Notification ? Notification.permission : "granted";
       const look = { work:["#fef2f2","#b91c1c","🍅"], break:["#f0fdf4","#166534","☕"], idle:["#f1f5f9","#475569","🍅"] }[pomo.phase];
       return (
         <div role="timer" style={{display:"flex",flexWrap:"wrap",alignItems:"center",gap:"6px 10px",padding:compact?"2px 8px":"8px 14px",background:look[0],color:look[1],borderBottom:"1px solid #e2e8f0",flexShrink:0}}>
@@ -2945,6 +2972,12 @@
           </span>
           {pomo.done>0 && <span title="Sessions finished in this run" style={{fontSize:11,fontWeight:600,whiteSpace:"nowrap"}}>× {pomo.done}</span>}
           {pomo.phase==="work" && pomo.marks>0 && <span title="Thoughts captured during this session" style={{fontSize:11,fontWeight:600,whiteSpace:"nowrap"}}>’ {pomo.marks}</span>}
+          {notif!=="granted" && (
+            <button disabled={notif==="denied"} onClick={()=>{ window.focus(); Pomo.arm(); }} className="btn btn-ghost btn-sm"
+              title={notif==="denied" ? "Blocked: allow notifications for this site in the browser's settings" : "Get a notification when the timer ends. The prompt appears in the main window."}>
+              🔕 {notif==="denied" ? "Blocked" : "Turn on"}
+            </button>
+          )}
           {pomo.phase==="break" && <button onClick={onSkip} className="btn btn-ghost btn-sm">Skip</button>}
           {pomo.phase==="idle"  && <button onClick={onNext} className="btn btn-pri btn-sm">▶ Next</button>}
           <button onClick={onStop} title="Stop (an unfinished session isn't counted)" aria-label="Stop timer" className="ibtn" style={{fontSize:15}}>×</button>
@@ -2984,17 +3017,15 @@
     }
 
     // ── FloatToday ────────────────────────────────────────────────
-    // Compact companion rendered into a Document Picture-in-Picture window (see
-    // App.openPip): an always-on-top floating panel to glance at today and capture
-    // into the Inbox while working in other apps. Self-contained — every mutation is
-    // passed in as a prop (it shares no React context with the main tree).
-    function FloatToday({ items, todayISO, pnameOf, canUndo, onUndo, onOpen, onComplete, onToggleFocus, onStartPomo, pomoBar, onCapture, onClose }) {
+    // The whole app at its smallest, rendered into a Document Picture-in-Picture window (see
+    // App.openPip) that stays on top while working in other apps. Every mutation is passed in
+    // as a prop (it shares no React context with the main tree), and renderView supplies the
+    // views that aren't plain lists.
+    function FloatToday({ items, todayISO, pnameOf, canUndo, onUndo, onOpen, onComplete, onToggleFocus, onStartPomo, pomoBar, onCapture, onClose, updateReady, onReload, renderView }) {
       const [tab, setTab]   = useState("today");
       const [text, setText] = useState("");
       const fire = () => { const t=text.trim(); if(!t) return; onCapture(t); setText(""); };
 
-      // Calendar, the review and chat need the room of the main window, so they open there.
-      const opensMain = v => v==="calendar" || v==="review" || v==="chat";
       const today = todayRows(items, todayISO);
       const listRows = l => (items[l]||[])
         .filter(i => !((l==="next"||l==="waiting") && isDeferred(i, todayISO)))
@@ -3002,13 +3033,13 @@
       const rows = tab==="today" ? today : tab==="done" ? listRows("done").slice(0,50) : listRows(tab);
       const count = v => v==="today" ? today.length : v==="inbox" ? (items.inbox||[]).length : 0;
       const iconBtn = {background:"none",border:"none",cursor:"pointer",lineHeight:1,padding:0,flexShrink:0};
+      const special = renderView(tab, setTab);
 
       return (
         <div style={{display:"flex",flexDirection:"column",height:"100vh",fontFamily:"'Inter',system-ui,sans-serif"}}>
           <nav style={{display:"flex",alignItems:"center",padding:"3px 4px",background:"#1e293b",flexShrink:0}}>
             {NAV.filter(v => v!=="chat" || Ai.enabled()).map(v => (
-              <button key={v} onClick={()=>opensMain(v) ? onOpen(v) : setTab(v)}
-                title={META[v].label+(opensMain(v)?" (opens the main window)":"")} aria-label={META[v].label}
+              <button key={v} onClick={()=>setTab(v)} title={META[v].label} aria-label={META[v].label}
                 style={{...iconBtn,flex:"1 1 0",minWidth:0,padding:"4px 0",fontSize:13,borderRadius:5,position:"relative",background:tab===v?"rgba(99,102,241,.45)":"none"}}>
                 {META[v].icon}
                 {count(v)>0 && <span style={{position:"absolute",top:0,right:1,fontSize:8,fontWeight:700,color:"#fff",background:v==="inbox"?"#ef4444":"#6366f1",borderRadius:8,padding:"0 3px"}}>{count(v)}</span>}
@@ -3020,13 +3051,22 @@
 
           {pomoBar}
 
-          <div style={{display:"flex",gap:4,padding:"4px 6px",background:"#fff",borderBottom:"1px solid #e2e8f0",flexShrink:0}}>
+          {updateReady && (
+            <div style={{display:"flex",alignItems:"center",gap:6,padding:"3px 8px",background:"#312e81",color:"#e0e7ff",fontSize:11,flexShrink:0}}>
+              <span style={{flex:1,minWidth:0}}>🔄 A new version is ready.</span>
+              <button onClick={onReload} style={{padding:"2px 8px",background:"#6366f1",color:"#fff",border:"none",borderRadius:5,cursor:"pointer",fontSize:11,fontWeight:700}}>Refresh</button>
+            </div>
+          )}
+
+          {tab!=="chat" && <div style={{display:"flex",gap:4,padding:"4px 6px",background:"#fff",borderBottom:"1px solid #e2e8f0",flexShrink:0}}>
             <input autoFocus value={text} onChange={e=>setText(e.target.value)} onKeyDown={e=>e.key==="Enter"&&fire()}
               placeholder="Capture a thought…" aria-label="Capture to Inbox" className="in in-sm" style={{flex:1,minWidth:0}}/>
             {onStartPomo && <button onClick={()=>onStartPomo({ id:null, title:META[tab].label })} title={"Start a pomodoro on "+META[tab].label} aria-label={"Start a pomodoro on "+META[tab].label} style={{...iconBtn,fontSize:14}}>🍅</button>}
-          </div>
+          </div>}
 
-          <div style={{flex:1,overflowY:"auto",background:"#fff"}}>
+          {special ? (
+            <div style={{flex:1,minHeight:0,overflowY:"auto",padding:6,background:"#fff"}}>{special}</div>
+          ) : <div style={{flex:1,overflowY:"auto",background:"#fff"}}>
             {rows.length===0 && <div style={{textAlign:"center",color:"#94a3b8",fontSize:11,padding:"16px 8px"}}>{META[tab].icon} Nothing here.</div>}
             {rows.map(i => {
               const foc = i._list==="next" && i.focusDate===todayISO;
@@ -3052,7 +3092,7 @@
                 </div>
               );
             })}
-          </div>
+          </div>}
         </div>
       );
     }
@@ -3062,7 +3102,7 @@
     // Read-mostly: click a day to inspect its items; complete or jump to the source
     // list from the day panel. Not a stored list — derives entirely from `items`.
     const WEEKDAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
-    function CalendarView({ items, pnameOf, onComplete, onGoto, onEdit }) {
+    function CalendarView({ compact, items, pnameOf, onComplete, onGoto, onEdit }) {
       const today = new Date(); today.setHours(0,0,0,0);
       const todayISO = isoDate(today);
       const [cursor,   setCursor]   = useState(() => new Date(today.getFullYear(), today.getMonth(), 1));
@@ -3112,16 +3152,16 @@
           </div>
 
           {/* weekday header */}
-          <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4,marginBottom:4}}>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(7,minmax(0,1fr))",gap:compact?2:4,marginBottom:4}}>
             {WEEKDAYS.map(w=>(
               <div key={w} style={{fontSize:10,fontWeight:700,color:"#94a3b8",textTransform:"uppercase",letterSpacing:".5px",textAlign:"center",padding:"2px 0"}}>{w}</div>
             ))}
           </div>
 
           {/* month grid */}
-          <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4}}>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(7,minmax(0,1fr))",gap:compact?2:4}}>
             {cells.map((d,idx)=>{
-              if (!d) return <div key={idx} style={{minHeight:74,background:"#f8fafc",borderRadius:8}}/>;
+              if (!d) return <div key={idx} style={{minHeight:compact?30:74,background:"#f8fafc",borderRadius:8}}/>;
               const iso     = isoDate(d);
               const dayList = byDate[iso] || [];
               const isToday = iso===todayISO;
@@ -3129,13 +3169,13 @@
               const overdue = iso < todayISO;
               return (
                 <button key={idx} onClick={()=>setSelected(iso)}
-                  style={{minHeight:74,textAlign:"left",padding:"5px 6px",borderRadius:8,cursor:"pointer",display:"flex",flexDirection:"column",gap:3,
+                  style={{minHeight:compact?30:74,textAlign:"left",padding:compact?"1px":"5px 6px",borderRadius:compact?6:8,cursor:"pointer",display:"flex",flexDirection:"column",gap:3,
                           background:isSel?"#eef2ff":"#fff",border:`1px solid ${isSel?"#6366f1":"#e2e8f0"}`,outline:"none"}}>
                   <div style={{display:"flex",justifyContent:"center"}}>
                     <span style={{fontSize:11,fontWeight:700,width:20,height:20,lineHeight:"20px",textAlign:"center",borderRadius:"50%",
                                   background:isToday?"#6366f1":"transparent",color:isToday?"#fff":"#475569"}}>{d.getDate()}</span>
                   </div>
-                  <div style={{display:"flex",flexDirection:"column",gap:2,overflow:"hidden"}}>
+                  <div style={{display:"flex",flexDirection:compact?"row":"column",justifyContent:compact?"center":"flex-start",gap:2,overflow:"hidden"}}>
                     {dayList.slice(0,3).map(i=>{
                       const isStart = i._kind==="start";
                       const od = overdue && !isStart;   // a start day in the past isn't "overdue"
@@ -3146,11 +3186,11 @@
                         <span style={{width:5,height:5,borderRadius:"50%",flexShrink:0,boxSizing:"border-box",
                                       background:isStart?"transparent":(od?"#ef4444":dot[i._list]||"#94a3b8"),
                                       border:isStart?"1.5px solid #1d4ed8":"none"}}/>
-                        <span style={{overflow:"hidden",textOverflow:"ellipsis"}}>{!isStart&&i.dueTime?<span style={{fontWeight:700}}>{i.dueTime} </span>:null}{i._list==="next"?(i.title.replace(/^\[[^\]]+\]\s*/,"")):i.title}</span>
+                        {!compact && <span style={{overflow:"hidden",textOverflow:"ellipsis"}}>{!isStart&&i.dueTime?<span style={{fontWeight:700}}>{i.dueTime} </span>:null}{i._list==="next"?(i.title.replace(/^\[[^\]]+\]\s*/,"")):i.title}</span>}
                       </div>
                       );
                     })}
-                    {dayList.length>3 && <div style={{fontSize:9,color:"#94a3b8",fontWeight:600}}>+{dayList.length-3} more</div>}
+                    {!compact && dayList.length>3 && <div style={{fontSize:9,color:"#94a3b8",fontWeight:600}}>+{dayList.length-3} more</div>}
                   </div>
                 </button>
               );
@@ -3630,37 +3670,30 @@
     }
 
     // ── Agent — a derived view like Today/Calendar; it proposes, the owner approves ──
-    // The transcript stays in its own device-local key: inside gtd_state_v1 it would reach
-    // OneDrive, the hub and every backup, and bloat each sync.
-    function ChatView({ items, archive, todayISO, pomo, onApply, onSaveContext }) {
+    // The session lives in App, so the main window and the float show one conversation and a
+    // request outlives leaving the view. The transcript stays in its own device-local key:
+    // inside gtd_state_v1 it would reach OneDrive, the hub and every backup, and bloat each sync.
+    function useAgentSession(items, archive, pomo) {
       const [msgs,  setMsgs]  = useState(() => {
         try { const m = JSON.parse(localStorage.getItem(AGENT_LS)); return Array.isArray(m) ? m : []; } catch { return []; }
       });
-      const [draft, setDraft] = useState("");
       const [step,  setStep]  = useState("");
       const [busy,  setBusy]  = useState(false);
       const [error, setError] = useState("");
       const [cost,  setCost]  = useState(0);
       const [proposal, setProposal] = useState(null);    // {ops, refs}
-      const [ctxText,  setCtxText]  = useState(null);    // null = the notes editor is closed
       const abort = React.useRef(null);
-      const foot  = React.useRef(null);
-      useEffect(() => { if (foot.current) foot.current.scrollIntoView({ block:"end" }); }, [msgs, busy, proposal]);
-      useEffect(() => () => { if (abort.current) abort.current.abort(); }, []);   // leave the view, drop the request
       useEffect(() => { try { localStorage.setItem(AGENT_LS, JSON.stringify(msgs.slice(-AGENT_KEEP))); } catch {} }, [msgs]);
 
-      const results = proposal ? applyAiOps(items, proposal.ops, { refs:proposal.refs, todayISO }).results : [];
-
-      const send = async () => {
-        const q = draft.trim();
-        if (!q || busy) return;
+      const send = async q => {
+        if (abort.current) return;
         const history = [...msgs, { role:"user", content:q }];
-        setMsgs(history); setDraft(""); setError(""); setProposal(null); setStep(""); setBusy(true);
+        setMsgs(history); setError(""); setProposal(null); setStep(""); setBusy(true);
         const ctrl = new AbortController(); abort.current = ctrl;
         const timerLine = pomo && pomo.phase === "work"
           ? `They are in a pomodoro on "${pomo.title}" with ${pomoClock(pomo.endsAt-Date.now())} left; keep it short and don't pull them off it.`
           : "No pomodoro is running.";
-        const r = await AiTasks.agent(items, archive, history, todayISO, timerLine, { signal:ctrl.signal, onStep:setStep });
+        const r = await AiTasks.agent(items, archive, history, isoDate(new Date()), timerLine, { signal:ctrl.signal, onStep:setStep });
         abort.current = null;
         setBusy(false); setStep("");
         if (r.usage) setCost(c => c + agentCost(r.usage));
@@ -3668,25 +3701,53 @@
         if (r.text) setMsgs(h => [...h, { role:"assistant", content:r.text }]);
         if (r.ops.length) setProposal({ ops:r.ops, refs:r.refs });
       };
+      return { msgs, step, busy, error, cost, proposal, send, setProposal,
+        stop:  () => { if (abort.current) abort.current.abort(); },
+        clear: () => { setMsgs([]); setProposal(null); setError(""); } };
+    }
+
+    function ChatView({ compact, agent, items, todayISO, onApply, onSaveContext }) {
+      const { msgs, step, busy, error, cost, proposal } = agent;
+      const [draft,   setDraft]   = useState("");
+      const [ctxText, setCtxText] = useState(null);    // null = the notes editor is closed
+      const foot  = React.useRef(null);
+      const input = React.useRef(null);
+      const started = msgs.length > 0;
+      useEffect(() => { if (started && foot.current) foot.current.scrollIntoView({ block:"end" }); }, [msgs, busy, proposal, error]);
+      useEffect(() => {   // the box grows with what's typed, up to a point
+        const t = input.current; if (!t) return;
+        t.style.height = "auto";
+        t.style.height = Math.min(t.scrollHeight, compact ? 72 : 200) + "px";
+      }, [draft]);
+
+      const results = proposal ? applyAiOps(items, proposal.ops, { refs:proposal.refs, todayISO }).results : [];
+
+      const submit = () => {
+        const q = draft.trim();
+        if (!q || busy) return;
+        setDraft(""); agent.send(q);
+      };
 
       const bubble = (role, text, k) => (
-        <div key={k} style={{display:"flex",justifyContent:role==="user"?"flex-end":"flex-start",marginBottom:8}}>
-          <div style={{maxWidth:"82%",padding:"9px 12px",borderRadius:12,fontSize:13,lineHeight:1.55,whiteSpace:"pre-wrap",wordBreak:"break-word",
+        <div key={k} style={{display:"flex",justifyContent:role==="user"?"flex-end":"flex-start",marginBottom:compact?5:8}}>
+          <div style={{maxWidth:compact?"92%":"82%",padding:compact?"5px 8px":"9px 12px",borderRadius:compact?9:12,fontSize:compact?12:13,lineHeight:1.5,whiteSpace:"pre-wrap",wordBreak:"break-word",
                        background:role==="user"?"#6366f1":"#fff",color:role==="user"?"#fff":"#1e293b",
                        border:role==="user"?"none":"1px solid #e2e8f0"}}>{text}</div>
         </div>
       );
 
+      // The two flex:1 blocks around the box hold it in the middle until the conversation starts.
+      // The box stays at the same place in the tree, so moving down doesn't lose focus.
       return (
-        <div style={{maxWidth:760,margin:"0 auto",display:"flex",flexDirection:"column",height:"100%"}}>
-          <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap",marginBottom:10}}>
-            <div style={{flex:1,minWidth:0,fontSize:12,color:"#64748b"}}>It reads your whole system and proposes changes. Nothing changes until you approve.</div>
-            <button onClick={()=>setCtxText(ctxText===null ? (items.agentContext||"") : null)} className="btn btn-ghost btn-sm">🧠 What it knows</button>
-            {msgs.length>0 && <button onClick={()=>{ setMsgs([]); setProposal(null); setError(""); }} disabled={busy} className="btn btn-ghost btn-sm">New chat</button>}
+        <div style={{maxWidth:760,width:"100%",margin:"0 auto",display:"flex",flexDirection:"column",height:"100%"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"flex-end",gap:6,flexWrap:"wrap",marginBottom:compact?4:10}}>
+            {!compact && <div style={{flex:1,minWidth:0,fontSize:12,color:"#64748b"}}>It reads your whole system and proposes changes. Nothing changes until you approve.</div>}
+            <button onClick={()=>setCtxText(ctxText===null ? (items.agentContext||"") : null)} className="btn btn-ghost btn-sm" title="What it knows" aria-label="What it knows">{compact ? "🧠" : "🧠 What it knows"}</button>
+            {started && <button onClick={agent.clear} disabled={busy} className="btn btn-ghost btn-sm">New chat</button>}
           </div>
           {ctxText!==null && (
             <div style={{marginBottom:10}}>
-              <textarea value={ctxText} onChange={e=>setCtxText(e.target.value)} rows={5} className="in in-sm" style={{width:"100%",resize:"vertical",fontFamily:"inherit"}}
+              <textarea value={ctxText} onChange={e=>setCtxText(e.target.value)} rows={compact?3:5} className="in in-sm" style={{width:"100%",resize:"vertical",fontFamily:"inherit"}}
                 placeholder="Who you are, what matters now, how you want it to help. Follows you to all your devices." aria-label="What the agent knows about you"/>
               <div style={{display:"flex",gap:6,marginTop:6}}>
                 <button onClick={()=>{ onSaveContext(ctxText); setCtxText(null); }} className="btn btn-pri btn-sm">Save</button>
@@ -3694,33 +3755,35 @@
               </div>
             </div>
           )}
-          <div style={{flex:1,overflowY:"auto",marginBottom:10,minHeight:120}}>
-            {!msgs.length && !busy && (
-              <div style={{fontSize:12,color:"#94a3b8",lineHeight:1.7}}>
-                Try: “what should I do in the next hour?” · “turn my inbox into next actions” · “which projects haven't moved?”
-                · “how many pomodoros did I spend on the report?”
-              </div>
-            )}
+          <div style={{flex:1,minHeight:0,overflowY:"auto",marginBottom:compact?5:12,display:"flex",flexDirection:"column",justifyContent:started?"flex-start":"flex-end"}}>
+            {!started && <div style={{textAlign:"center",fontSize:compact?14:22,fontWeight:700,color:"#334155"}}>What should we look at?</div>}
             {msgs.map((m,k)=>bubble(m.role, m.content, k))}
             {busy && <div style={{fontSize:11,color:"#94a3b8",marginBottom:8}}>{step ? `reading: ${step}…` : "thinking…"}</div>}
             {error && <div style={{fontSize:12,color:"#b91c1c",padding:"8px 0"}}>{error}</div>}
             {proposal && (
               <AiOpsReview ops={proposal.ops} results={results} applyLabel="Approve"
-                onApply={chosen=>{ onApply(proposal.ops.filter((_,i)=>chosen.indexOf(i)>=0), proposal.refs); setProposal(null); }}
-                onCancel={()=>setProposal(null)}/>
+                onApply={chosen=>{ onApply(proposal.ops.filter((_,i)=>chosen.indexOf(i)>=0), proposal.refs); agent.setProposal(null); }}
+                onCancel={()=>agent.setProposal(null)}/>
             )}
             <div ref={foot}/>
           </div>
-          <div style={{display:"flex",gap:6}}>
-            <input className="in in-sm" style={{flex:1,minWidth:0}} value={draft} placeholder="Ask, or tell it what to do…" aria-label="Message to the agent"
-              onChange={e=>setDraft(e.target.value)} onKeyDown={e=>e.key==="Enter"&&send()}/>
+          <div className="agent-box" style={{display:"flex",alignItems:"flex-end",gap:8,flexShrink:0,background:"#fff",border:"1px solid #cbd5e1",borderRadius:compact?10:16,
+                       padding:compact?"4px 4px 4px 9px":"12px 12px 12px 16px",boxShadow:compact?"none":"0 4px 16px rgba(15,23,42,.08)"}}>
+            <textarea ref={input} autoFocus={!window.matchMedia("(pointer:coarse)").matches} rows={compact?1:2} value={draft} placeholder="Ask, or tell it what to do…" aria-label="Message to the agent"
+              style={{flex:1,minWidth:0,border:"none",outline:"none",resize:"none",background:"transparent",color:"#1e293b",fontFamily:"inherit",fontSize:compact?12.5:15,lineHeight:1.45,padding:compact?"3px 0":0}}
+              onChange={e=>setDraft(e.target.value)}
+              onKeyDown={e=>{ if (e.key==="Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); submit(); } }}/>
             {busy
-              ? <button onClick={()=>abort.current&&abort.current.abort()} className="btn btn-ghost btn-sm">Stop</button>
-              : <button onClick={send} disabled={!draft.trim()} className="btn btn-pri btn-sm">Send</button>}
+              ? <button onClick={agent.stop} className="btn btn-ghost btn-sm">Stop</button>
+              : <button onClick={submit} disabled={!draft.trim()} className="btn btn-pri btn-sm">Send</button>}
           </div>
-          <div style={{fontSize:10,color:"#94a3b8",marginTop:6,textAlign:"right"}}>
-            {cost>0 ? `≈ $${cost.toFixed(3)} since you opened this view` : ""}
-          </div>
+          {!started && (
+            <div style={{flex:1,minHeight:0,overflow:"hidden",paddingTop:12,textAlign:"center",fontSize:12,color:"#94a3b8",lineHeight:1.7}}>
+              {!compact && <>Try: “what should I do in the next hour?” · “turn my inbox into next actions” · “which projects haven't moved?”
+              · “how many pomodoros did I spend on the report?”</>}
+            </div>
+          )}
+          {cost>0 && <div style={{fontSize:10,color:"#94a3b8",marginTop:compact?2:6,textAlign:"right"}}>≈ ${cost.toFixed(3)} this session</div>}
         </div>
       );
     }

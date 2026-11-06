@@ -116,7 +116,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v43";
+    const APP_VERSION = "v44";
 
     // Default contexts — seed only. Since schema v2 the live list is state.contexts,
     // editable in-app (Sync & Backup → Contexts); this constant is the fallback/seed.
@@ -2074,8 +2074,9 @@
         const b = mainBoundsRef.current;
         if (!b) return;
         mainBoundsRef.current = null;
-        window.moveTo(b.x, b.y);
-        window.resizeTo(b.w, b.h);
+        const apply = () => { window.moveTo(b.x, b.y); window.resizeTo(b.w, b.h); };
+        apply();
+        setTimeout(apply, 300);   // Chrome can drop the resize while the float is closing
       };
       const showMain = () => { restoreMain(); window.focus(); };
       const closePip = () => {

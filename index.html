@@ -116,7 +116,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v41";
+    const APP_VERSION = "v42";
 
     // Default contexts — seed only. Since schema v2 the live list is state.contexts,
     // editable in-app (Sync & Backup → Contexts); this constant is the fallback/seed.
@@ -1004,10 +1004,19 @@
     // Use a dedicated key with a spend limit set in the Anthropic Console.
     const AI_KEY_LS  = "gtd_anthropic_key";      // device-local, like OD_FLAG
     const AI_URL     = "https://api.anthropic.com/v1/messages";
+    const AI_MODEL_LS = "gtd_anthropic_model";   // device-local, like the key
     const AI_MODEL   = "claude-opus-5-5";
-    // USD per million tokens for AI_MODEL, for the running estimate shown beside the agent.
-    const AI_PRICE   = { input:4, output:20, cacheRead:0.2, cacheWrite:5 };
-    const agentCost  = u => Object.keys(AI_PRICE).reduce((sum, k) => sum + (u[k]||0) * AI_PRICE[k] / 1e6, 0);
+    // Prices are USD per million tokens, for the running estimate shown beside the agent.
+    // Haiku answers a 400 to `fallbacks`, since it has no server-side fallback.
+    // shortcut: Haiku costs 5x more once a prompt passes 100K tokens and this shows the lower rate, fix it if a real system gets that big.
+    const AI_MODELS  = [
+      { id:"claude-fable-5-1",  name:"Fable 5.1",  price:{ input:10,  output:50,  cacheRead:0.25, cacheWrite:12.5 } },
+      { id:"claude-opus-5-5",   name:"Opus 5.5",   price:{ input:4,   output:20,  cacheRead:0.2,  cacheWrite:5 } },
+      { id:"claude-sonnet-5-5", name:"Sonnet 5.5", price:{ input:2,   output:10,  cacheRead:0.2,  cacheWrite:2.5 } },
+      { id:"claude-haiku-5-5",  name:"Haiku 5.5",  price:{ input:0.1, output:0.5, cacheRead:0.01, cacheWrite:0.125 }, noFallback:true },
+    ];
+    const aiModelOf  = id => AI_MODELS.find(m => m.id === id) || AI_MODELS.find(m => m.id === AI_MODEL);
+    const agentCost  = (u, model) => { const p = aiModelOf(model).price; return Object.keys(p).reduce((sum, k) => sum + (u[k]||0) * p[k] / 1e6, 0); };
     const AGENT_SORT_INBOX = "Xử lý toàn bộ Inbox giúp tôi: mỗi mục đề xuất thành một việc cụ thể tiếp theo, hoặc đưa vào đúng danh sách nếu không phải việc cần làm.";
     const AGENT_LS   = "gtd_agent_chat_v1";      // device-local: a transcript would bloat every sync
     const AGENT_KEEP = 60;
@@ -1022,6 +1031,8 @@
         catch {}
       },
       masked()  { const k = this.key(); return k ? k.slice(0,7) + "…" + k.slice(-4) : ""; },
+      model()   { try { return aiModelOf(localStorage.getItem(AI_MODEL_LS)).id; } catch { return AI_MODEL; } },
+      setModel(id) { try { localStorage.setItem(AI_MODEL_LS, id); } catch {} },
       online()  { return typeof navigator === "undefined" || navigator.onLine !== false; },
       _headers(beta) {
         return {
@@ -1054,12 +1065,14 @@
         const opt = o || {};
         if (!this.enabled()) return this._fail("no-key", "No API key set.");
         if (!this.online())  return this._fail("offline", "Offline — Claude needs a connection.");
+        const model = body.model || this.model();
+        const fallback = aiModelOf(model).noFallback ? {} : { fallbacks:"default" };
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), opt.timeout || AI_TIMEOUT);
         const onOuter = () => ctrl.abort();
         if (opt.signal) opt.signal.addEventListener("abort", onOuter);
         try {
-          const res = await fetch(AI_URL, { method:"POST", headers:this._headers(opt.beta), body:JSON.stringify(body), signal:ctrl.signal });
+          const res = await fetch(AI_URL, { method:"POST", headers:this._headers(fallback.fallbacks && "server-side-fallback-2026-07-01"), body:JSON.stringify({ ...body, model, ...fallback }), signal:ctrl.signal });
           if (!res.ok) return await this._err(res);
           return { ok:true, msg: await res.json() };
         } catch (e) {
@@ -1077,7 +1090,7 @@
       // a refusal or a truncated answer reports itself instead of as a missing result.
       // → {ok:true, data, usage} | {ok:false, code, msg}
       async structured(body, o) {
-        const r = await this.send({ ...body, fallbacks:"default" }, { ...(o||{}), beta:"server-side-fallback-2026-07-01" });
+        const r = await this.send(body, o);
         if (!r.ok) return r;
         const m = r.msg || {};
         if (m.stop_reason === "refusal")    return this._fail("refusal", "Claude declined that request.");
@@ -1088,7 +1101,7 @@
       },
       // Cheapest possible round trip — proves the key and the CORS path in one click.
       async ping() {
-        const r = await this.send({ model:AI_MODEL, max_tokens:1, output_config:{ effort:"low" },
+        const r = await this.send({ max_tokens:1, output_config:{ effort:"low" },
                                     messages:[{ role:"user", content:"hi" }] }, { timeout:20000 });
         return r.ok ? { ok:true } : r;   // stop_reason max_tokens is expected and fine
       },
@@ -1234,7 +1247,7 @@
           "Set `actionable` false only when the item needs no action at all.",
         ].join("\n");
         const r = await Ai.structured({
-          model: AI_MODEL, max_tokens: 2000,
+          max_tokens: 2000,
           thinking: { type:"adaptive" },
           output_config: { effort:"low" }, ...aiSubmit(AI_SCHEMAS.clarify),
           system: aiSys(rules, aiCtxLine(state) + "\n\nExisting projects:\n" + (p.text || "(none)"), true),
@@ -1257,7 +1270,7 @@
           "If the project is already blocked on a person, propose a `waiting` item instead.",
         ].join("\n");
         const r = await Ai.structured({
-          model: AI_MODEL, max_tokens: 3000,
+          max_tokens: 3000,
           thinking: { type:"adaptive" },
           output_config: { effort:"medium" }, ...aiSubmit(AI_SCHEMAS.breakdown),
           system: aiSys(rules, aiCtxLine(state), false),
@@ -1283,7 +1296,7 @@
           "than a missing one. Zero ops is a perfectly good answer.",
         ].join("\n");
         const r = await Ai.structured({
-          model: AI_MODEL, max_tokens: 8000,
+          max_tokens: 8000,
           thinking: { type:"adaptive", display:"summarized" },
           output_config: { effort:"high" }, ...aiSubmit(AI_SCHEMAS.review),
           system: aiSys(rules, aiCtxLine(state) + "\n\n" + p.text, false),
@@ -1298,6 +1311,7 @@
       // dropped from the transcript without touching any thinking block.
       async agent(state, archive, history, todayISO, timerLine, o) {
         const opt = o || {};
+        const model = opt.model || Ai.model();   // thinking blocks are bound to their model, so a turn must not switch
         const p = aiProjection(state, todayISO, { lists:["inbox","next","waiting","projects","someday","reference","done"], max:200, doneDays:14 });
         const system = [
           { type:"text", text: AI_GTD_RULES + "\n\n" + AI_AGENT_RULES, cache_control:{ type:"ephemeral" } },
@@ -1310,12 +1324,11 @@
         const used = { input:0, output:0, cacheRead:0, cacheWrite:0 };
         for (let step = 0; step < AGENT_MAX_STEPS; step++) {
           const r = await Ai.send({
-            model: AI_MODEL, max_tokens: 16000,
+            model, max_tokens: 16000,
             thinking: { type:"adaptive" },
             output_config: { effort:"medium" },
-            fallbacks: "default",
             tools: AGENT_TOOLS, system, messages: msgs,
-          }, { timeout:180000, signal:opt.signal, beta:"server-side-fallback-2026-07-01" });
+          }, { timeout:180000, signal:opt.signal });
           if (!r.ok) return { ...r, usage:used };
           const m = r.msg || {}, u = m.usage || {};
           used.input += u.input_tokens||0; used.output += u.output_tokens||0;
@@ -1423,6 +1436,7 @@
       // Claude: the key lives in localStorage, not in state, so a save/clear has to
       // nudge React by hand for the AI affordances to appear or vanish without a reload.
       const [aiKeyTick, setAiKeyTick]     = useState(0);
+      const [aiModel, setAiModel]         = useState(() => Ai.model());
       const [aiTest,    setAiTest]        = useState(null);   // null | "…" | {ok} | {ok:false,msg}
       const [syncTick,  setSyncTick]      = useState(0);   // bump to re-render the "last synced" label
       const [archive, setArchiveState] = useState([]);   // rotated-out old Done items (separate store)
@@ -1631,6 +1645,7 @@
       const aiOn     = React.useMemo(() => Ai.enabled(), [aiKeyTick]);
       const aiOnline = Ai.online();
       const saveAiKey = useCallback(k => { Ai.setKey(k); setAiTest(null); setAiKeyTick(t => t + 1); }, []);
+      const pickModel = useCallback(id => { Ai.setModel(id); setAiModel(id); }, []);
       const testAiKey = useCallback(async () => {
         setAiTest("…");
         const r = await Ai.ping();
@@ -1955,7 +1970,7 @@
       // there); App re-renders it via the effect below whenever `items` change.
       const pipSupported = typeof window!=="undefined" && "documentPictureInPicture" in window;
       const renderChat = compact => (
-        <ChatView compact={compact} agent={agent} items={items} todayISO={isoDate(new Date())} onApply={applyAi}
+        <ChatView compact={compact} agent={agent} model={aiModel} onModel={pickModel} items={items} todayISO={isoDate(new Date())} onApply={applyAi}
           onSaveContext={text=>upd({ ...itemsRef.current, agentContext:text })}/>
       );
       const renderReview = onGoto => {
@@ -2030,7 +2045,7 @@
               ) : null}
             onClose={closePip}/>
         );
-      }, [pipOn, items, pomo, history, archive, updateReady, aiOn, aiJob, agent.msgs, agent.busy, agent.step, agent.error, agent.cost, agent.proposal]);
+      }, [pipOn, items, pomo, history, archive, updateReady, aiOn, aiModel, aiJob, agent.msgs, agent.busy, agent.step, agent.error, agent.cost, agent.proposal]);
 
       // `?float=1` — the laptop widget shortcut. Document-PiP requires a user gesture,
       // so the automatic attempt is usually refused; when it is we fall back to a bare
@@ -2391,7 +2406,7 @@
                 onConnect: connectDrive, onDisconnect: disconnectDrive, onSyncNow: syncNow,
               }}
               ai={{
-                hasKey: aiOn, masked: Ai.masked(), model: AI_MODEL, online: aiOnline,
+                hasKey: aiOn, masked: Ai.masked(), model: aiModel, onModel: pickModel, online: aiOnline,
                 test: aiTest, onSave: saveAiKey, onClear: ()=>saveAiKey(""), onTest: testAiKey,
               }}
               onClose={()=>setShowData(false)}/>
@@ -3737,10 +3752,11 @@
         const timerLine = pomo && pomo.phase === "work"
           ? `They are in a pomodoro on "${pomo.title}" with ${pomoClock(pomo.endsAt-Date.now())} left; keep it short and don't pull them off it.`
           : "No pomodoro is running.";
-        const r = await AiTasks.agent(items, archive, history, isoDate(new Date()), timerLine, { signal:ctrl.signal, onStep:setStep });
+        const model = Ai.model();
+        const r = await AiTasks.agent(items, archive, history, isoDate(new Date()), timerLine, { model, signal:ctrl.signal, onStep:setStep });
         abort.current = null;
         setBusy(false); setStep("");
-        if (r.usage) setCost(c => c + agentCost(r.usage));
+        if (r.usage) setCost(c => c + agentCost(r.usage, model));
         if (!r.ok) { if (r.code !== "cancelled") setError(r.msg); return; }
         if (r.text) setMsgs(h => [...h, { role:"assistant", content:r.text }]);
         if (r.ops.length) setProposal({ ops:r.ops, refs:r.refs });
@@ -3750,7 +3766,16 @@
         clear: () => { setMsgs([]); setProposal(null); setError(""); } };
     }
 
-    function ChatView({ compact, agent, items, todayISO, onApply, onSaveContext }) {
+    function ModelSelect({ compact, value, onChange }) {
+      return (
+        <select value={value} onChange={e=>onChange(e.target.value)} className="in in-sm" aria-label="Claude model" title="Model for the agent and every AI task. Prices are USD per million tokens, in/out."
+          style={{width:"auto",maxWidth:"100%",fontSize:compact?11:12,padding:compact?"1px 2px":undefined}}>
+          {AI_MODELS.map(m => <option key={m.id} value={m.id}>{compact ? m.name : `${m.name} · $${m.price.input}/$${m.price.output}`}</option>)}
+        </select>
+      );
+    }
+
+    function ChatView({ compact, agent, model, onModel, items, todayISO, onApply, onSaveContext }) {
       const { msgs, step, busy, error, cost, proposal } = agent;
       const [draft,   setDraft]   = useState("");
       const [ctxText, setCtxText] = useState(null);    // null = the notes editor is closed
@@ -3786,6 +3811,7 @@
         <div style={{maxWidth:760,width:"100%",margin:"0 auto",display:"flex",flexDirection:"column",height:"100%"}}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"flex-end",gap:6,flexWrap:"wrap",marginBottom:compact?4:10}}>
             {!compact && <div style={{flex:1,minWidth:0,fontSize:12,color:"#64748b"}}>It reads your whole system and proposes changes. Nothing changes until you approve.</div>}
+            <ModelSelect compact={compact} value={model} onChange={onModel}/>
             <button onClick={()=>setCtxText(ctxText===null ? (items.agentContext||"") : null)} className="btn btn-ghost btn-sm" title="What it knows" aria-label="What it knows">{compact ? "🧠" : "🧠 What it knows"}</button>
             {started && <button onClick={agent.clear} disabled={busy} className="btn btn-ghost btn-sm">New chat</button>}
           </div>
@@ -4312,8 +4338,8 @@
               <div style={{border:"1px solid #e2e8f0",borderRadius:8,padding:"11px 13px",marginBottom:16}}>
                 <div style={{fontSize:12,fontWeight:600,color:"#1e293b",marginBottom:2}}>✨ Key saved</div>
                 <div style={{fontSize:11,color:"#64748b",marginBottom:2,wordBreak:"break-all"}}>{a.masked}</div>
-                <div style={{fontSize:10,color:"#94a3b8",marginBottom:10}}>
-                  {a.model}{!a.online && " · offline"}
+                <div style={{display:"flex",alignItems:"center",gap:7,fontSize:10,color:"#94a3b8",marginBottom:10}}>
+                  <ModelSelect value={a.model} onChange={a.onModel}/>{!a.online && "offline"}
                 </div>
                 <div style={{display:"flex",gap:7}}>
                   <button onClick={a.onTest} disabled={a.test==="…"}

@@ -116,7 +116,7 @@
 
     // App build version — keep in sync with CACHE in static/sw.js. Shown in the
     // sidebar footer so you can tell at a glance which build a device is running.
-    const APP_VERSION = "v40";
+    const APP_VERSION = "v41";
 
     // Default contexts — seed only. Since schema v2 the live list is state.contexts,
     // editable in-app (Sync & Backup → Contexts); this constant is the fallback/seed.
@@ -1008,6 +1008,7 @@
     // USD per million tokens for AI_MODEL, for the running estimate shown beside the agent.
     const AI_PRICE   = { input:4, output:20, cacheRead:0.2, cacheWrite:5 };
     const agentCost  = u => Object.keys(AI_PRICE).reduce((sum, k) => sum + (u[k]||0) * AI_PRICE[k] / 1e6, 0);
+    const AGENT_SORT_INBOX = "Xử lý toàn bộ Inbox giúp tôi: mỗi mục đề xuất thành một việc cụ thể tiếp theo, hoặc đưa vào đúng danh sách nếu không phải việc cần làm.";
     const AGENT_LS   = "gtd_agent_chat_v1";      // device-local: a transcript would bloat every sync
     const AGENT_KEEP = 60;
     const AI_VERSION = "2023-06-01";
@@ -2012,6 +2013,14 @@
             onCapture={captureThought}
             onStartPomo={canStartPomo ? startPomo : null} pomoBar={renderPomoBar(null)}
             updateReady={updateReady} onReload={reloadApp}
+            inbox={{
+              next:  (it,title) => move("inbox",it.id,"next",{ title, context:"@anywhere" }),
+              start: canStartPomo ? (it,title) => { move("inbox",it.id,"next",{ title, context:"@anywhere" }); startPomo({ id:it.id, title }); } : null,
+              to:    (it,list,patch) => move("inbox",it.id,list,patch),
+              trash: it => del("inbox",it.id),
+              more:  it => { setProcItem(it); window.focus(); },
+              sort:  aiOn ? () => agent.send(AGENT_SORT_INBOX) : null,
+            }}
             renderView={(v, onGoto) => v==="chat" ? renderChat(true)
               : v==="review" ? renderReview(onGoto)
               : v==="calendar" ? (
@@ -2317,7 +2326,8 @@
                 shown.length===0
                   ? <EmptyState list="inbox"/>
                   : <InboxFocus item={shown[shown.length-1]} total={shown.length}
-                      onProcess={()=>setProcItem(shown[shown.length-1])}/>
+                      onProcess={()=>setProcItem(shown[shown.length-1])}
+                      onSort={aiOn ? ()=>{ agent.send(AGENT_SORT_INBOX); setActive("chat"); } : null}/>
               ) : (liveShown.length===0 && deferredShown.length===0) ? (
                 <EmptyState list={active} ctx={ctx}/>
               ) : (
@@ -3021,7 +3031,7 @@
     // App.openPip) that stays on top while working in other apps. Every mutation is passed in
     // as a prop (it shares no React context with the main tree), and renderView supplies the
     // views that aren't plain lists.
-    function FloatToday({ items, todayISO, pnameOf, canUndo, onUndo, onOpen, onComplete, onToggleFocus, onStartPomo, pomoBar, onCapture, onClose, updateReady, onReload, renderView }) {
+    function FloatToday({ items, todayISO, pnameOf, canUndo, onUndo, onOpen, onComplete, onToggleFocus, onStartPomo, pomoBar, onCapture, onClose, updateReady, onReload, renderView, inbox }) {
       const [tab, setTab]   = useState("today");
       const [text, setText] = useState("");
       const fire = () => { const t=text.trim(); if(!t) return; onCapture(t); setText(""); };
@@ -3034,6 +3044,9 @@
       const count = v => v==="today" ? today.length : v==="inbox" ? (items.inbox||[]).length : 0;
       const iconBtn = {background:"none",border:"none",cursor:"pointer",lineHeight:1,padding:0,flexShrink:0};
       const special = renderView(tab, setTab);
+      const card   = tab==="inbox" && rows.length ? rows[rows.length-1] : null;   // oldest first, as in the main window
+      const listed = card ? rows.slice(0,-1) : rows;
+      const waitingInbox = (tab==="today"||tab==="next") && (items.inbox||[]).length;
 
       return (
         <div style={{display:"flex",flexDirection:"column",height:"100vh",fontFamily:"'Inter',system-ui,sans-serif"}}>
@@ -3067,8 +3080,11 @@
           {special ? (
             <div style={{flex:1,minHeight:0,overflowY:"auto",padding:6,background:"#fff"}}>{special}</div>
           ) : <div style={{flex:1,overflowY:"auto",background:"#fff"}}>
-            {rows.length===0 && <div style={{textAlign:"center",color:"#94a3b8",fontSize:11,padding:"16px 8px"}}>{META[tab].icon} Nothing here.</div>}
-            {rows.map(i => {
+            {card && <FloatProcess key={card.id} item={card} total={rows.length} inbox={inbox} onSorted={()=>setTab("chat")}/>}
+            {!card && rows.length===0 && (waitingInbox
+              ? <button onClick={()=>setTab("inbox")} style={{...iconBtn,display:"block",width:"100%",color:"#6366f1",fontSize:12,fontWeight:600,padding:"16px 8px"}}>📥 {(items.inbox||[]).length} in the Inbox — turn them into next actions →</button>
+              : <div style={{textAlign:"center",color:"#94a3b8",fontSize:11,padding:"16px 8px"}}>{META[tab].icon} Nothing here.</div>)}
+            {listed.map(i => {
               const foc = i._list==="next" && i.focusDate===todayISO;
               const late = i.dueDate && i.dueDate < todayISO && i._list!=="done";
               const pname = pnameOf(i);
@@ -3093,6 +3109,34 @@
               );
             })}
           </div>}
+        </div>
+      );
+    }
+
+    // One inbox item at a time, oldest first. Enter makes it a next action, so a run of them goes
+    // quickly; what needs more than a title (project, waiting, dates) goes to the full dialog.
+    function FloatProcess({ item, total, inbox, onSorted }) {
+      const [title, setTitle] = useState(item.title);
+      const t = title.trim();
+      const small = {padding:"2px 6px",fontSize:10.5,background:"#fff",border:"1px solid #ddd6fe",borderRadius:5,cursor:"pointer",color:"#4338ca",whiteSpace:"nowrap"};
+      return (
+        <div style={{padding:"5px 6px",background:"#f5f3ff",borderBottom:"1px solid #ddd6fe"}}>
+          <div style={{fontSize:10,color:"#6d28d9",marginBottom:3}}>{total} to process · what's the next physical action?</div>
+          <div style={{display:"flex",gap:4,marginBottom:4}}>
+            <input autoFocus value={title} onChange={e=>setTitle(e.target.value)} onFocus={e=>e.target.select()} aria-label="Next action"
+              onKeyDown={e=>{ if (e.key==="Enter" && t && !e.nativeEvent.isComposing) inbox.next(item,t); }}
+              className="in in-sm" style={{flex:1,minWidth:0}}/>
+            <button onClick={()=>inbox.next(item,t)} disabled={!t} title="Make it a next action (Enter)" aria-label="Make it a next action" className="btn btn-pri btn-sm">⚡</button>
+            {inbox.start && <button onClick={()=>inbox.start(item,t)} disabled={!t} title="Make it a next action and start a pomodoro on it" aria-label="Make it a next action and start a pomodoro" className="btn btn-ghost btn-sm">🍅</button>}
+          </div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:3}}>
+            <button onClick={()=>inbox.to(item,"done",{doneAt:ts()})} title="Took under two minutes: already done" style={small}>✓ Done</button>
+            <button onClick={()=>inbox.to(item,"someday",{})} style={small}>🌟 Someday</button>
+            <button onClick={()=>inbox.to(item,"reference",{})} style={small}>📁 Reference</button>
+            <button onClick={()=>inbox.trash(item)} title="Trash" aria-label="Trash" style={small}>🗑</button>
+            <button onClick={()=>inbox.more(item)} title="Project, waiting for, dates (opens the main window)" style={small}>⋯ More</button>
+            {inbox.sort && <button onClick={()=>{ inbox.sort(); onSorted(); }} title="The Agent proposes for the whole inbox; nothing changes until you approve" style={small}>✨ All</button>}
+          </div>
         </div>
       );
     }
@@ -3917,7 +3961,7 @@
     }
 
     // ── InboxFocus ────────────────────────────────────────────────
-    function InboxFocus({ item, total, onProcess }) {
+    function InboxFocus({ item, total, onProcess, onSort }) {
       return (
         <div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"48px 24px 24px"}}>
           <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",textTransform:"uppercase",letterSpacing:"1px",marginBottom:28}}>
@@ -3932,6 +3976,7 @@
             <button onClick={onProcess} className="btn btn-pri" style={{width:"100%",padding:"13px",fontSize:14,borderRadius:9,fontWeight:700}}>
               Process this item →
             </button>
+            {onSort && <button onClick={onSort} className="btn btn-ghost" style={{width:"100%",marginTop:8}}>✨ Have the Agent propose for the whole inbox</button>}
           </div>
         </div>
       );

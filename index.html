@@ -55,6 +55,25 @@
         display:block; position:fixed; inset:0;
         background:rgba(0,0,0,.5); z-index:110;
       }
+      /* Sizes for a thumb at arm's length. Scoped to the main layout and the drawer: the
+         desktop float is also this narrow and has sizes of its own. Inline styles need !important. */
+      .app-main .item-title{ font-size:15px !important; line-height:1.35; }
+      .app-main .tag{ font-size:12px !important; padding:3px 8px !important; }
+      .app-main .item-proj{ font-size:12px !important; }
+      .app-main .item-card{ flex-wrap:wrap; }
+      .app-main .item-card > .row-acts{ flex-basis:100%; justify-content:flex-end; }
+      .app-main .filter-bar{ flex-wrap:nowrap !important; overflow-x:auto; scrollbar-width:none; }
+      .app-main .filter-bar::-webkit-scrollbar{ display:none; }
+      .app-main .filter-bar > *{ flex-shrink:0; }
+      .app-main .filter-bar .chip{ height:36px; padding:0 13px !important; font-size:13px; }
+      .app-main .main-head, .app-main .main-body, .app-main .filter-bar, .app-main .add-form{
+        padding-left:16px !important; padding-right:16px !important; }
+      .app-main .main-head .btn-sm{ min-height:38px; font-size:13px; }
+      .app-sidebar .nav-row{ padding:12px 12px !important; font-size:15px !important; }
+      .app-sidebar .nav-row > span + span{ font-size:11px !important; padding:2px 7px !important; }
+      .app-sidebar .sb-capture input{ font-size:16px !important; padding:10px 12px !important; min-width:0; }
+      .app-sidebar .sb-capture button{ min-width:44px; font-size:18px !important; }
+      .opt{ font-size:14px !important; padding:12px !important; }
     }
 
     /* ── Design system ──
@@ -74,16 +93,19 @@
     .agent-box:focus-within{ border-color:var(--indigo) !important; }
     .in-sm{ padding:7px 9px; font-size:12px; border-radius:7px; }
     select.in{ cursor:pointer; }
+    /* native date and select boxes size differently from text boxes with the same padding */
+    input.in-sm, select.in-sm{ height:32px; }
+    input.in:not(.in-sm), select.in:not(.in-sm){ height:36px; }
     /* stacked label + control */
     .fld{ display:flex; flex-direction:column; gap:3px; min-width:0; }
-    .fld > span{ font-size:9px; font-weight:600; color:var(--faint);
+    .fld > span{ font-size:10px; font-weight:600; color:var(--muted);
                  text-transform:uppercase; letter-spacing:.4px; }
     /* buttons */
     .btn{ border:none; border-radius:8px; cursor:pointer; font-size:13px; font-weight:600;
           padding:9px 16px; line-height:1.2; font-family:inherit;
           transition:background .15s, border-color .15s, color .15s; }
     .btn:disabled{ cursor:default; }
-    .btn-sm{ padding:6px 12px; font-size:12px; border-radius:7px; }
+    .btn-sm{ padding:6px 12px; font-size:12px; border-radius:7px; min-height:30px; }
     .btn-pri{ background:var(--indigo); color:#fff; }
     .btn-pri:hover{ background:var(--indigo-d); }
     .btn-pri:disabled{ background:var(--line); color:var(--faint); }
@@ -93,9 +115,26 @@
     .ibtn{ background:none; border:none; cursor:pointer; color:var(--faint);
            line-height:1; padding:0 2px; transition:color .15s; }
     .ibtn:hover{ color:var(--indigo); }
+    /* an item's note under its title: three lines, the editor has the rest */
+    .note{ font-size:11px; color:var(--muted); margin-top:2px; white-space:pre-wrap; word-break:break-word; line-height:1.45;
+           display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
+    /* the round "done" button keeps its size and gains a finger-sized hit area */
+    .tick{ position:relative; }
+    .tick::after{ content:""; position:absolute; inset:-9px; }
+    .tick-s::after{ inset:-4px -6px -4px -8px; }   /* the float's rows are too close for the full area */
+    /* a row's icons sit 4px apart and one of them deletes: on a touch screen each gets room */
+    @media (pointer:coarse){
+      .row-acts{ gap:2px !important; }
+      .row-acts > button, .row-acts > div > button{ min-width:34px; min-height:34px; }
+      .ibtn{ min-width:32px; min-height:32px; }
+      /* 16px is where a phone browser stops zooming the page when a field takes focus */
+      input:not([type=date]):not([type=time]):not([type=number]):not([type=checkbox]), textarea{ font-size:16px !important; }
+      input.in-sm, select.in-sm{ height:38px; }
+      .fld > span{ font-size:11px; }
+    }
     /* filter chip */
-    .chip{ padding:3px 10px; border-radius:20px; border:1px solid var(--line);
-           background:#fff; color:var(--muted); cursor:pointer; font-size:11px; font-family:inherit; }
+    .chip{ height:28px; padding:0 12px; border-radius:20px; border:1px solid var(--line);
+           background:#fff; color:var(--muted); cursor:pointer; font-size:12px; font-family:inherit; }
     .chip:hover{ border-color:var(--indigo); }
     .chip.on{ border-color:var(--indigo); background:var(--indigo); color:#fff; font-weight:600; }
     /* modal chrome */
@@ -104,7 +143,7 @@
     .mbox{ background:#fff; border-radius:14px; padding:22px; width:420px; max-width:92vw;
            max-height:92vh; overflow-y:auto; box-shadow:0 20px 60px rgba(0,0,0,.2); }
     /* uppercase section label */
-    .slabel{ font-size:10px; font-weight:700; color:var(--faint);
+    .slabel{ font-size:11px; font-weight:700; color:var(--muted);
              text-transform:uppercase; letter-spacing:.8px; }
   </style>
 </head>

@@ -382,6 +382,7 @@ const AI_OP_SCHEMA = {
     dueTime: { type:"string", description:"HH:MM, 24h. Only with dueDate, and only for a true appointment." },
     startDate:{ type:"string", description:"YYYY-MM-DD. Tickler — hides the item until that day." },
     waitingFor:{ type:"string", description:"Who the item is blocked on." },
+    note:{ type:"string", description:"Free text kept with the item: details, links, what was agreed." },
     energy:  { type:"string", enum: ["", ...ENERGIES] },
     time:    { type:"string", enum: ["", ...TIMES] },
     on:      { type:"boolean", description:"focus on/off" },

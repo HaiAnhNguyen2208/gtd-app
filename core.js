@@ -263,6 +263,28 @@ const todayRows = (state, todayISO) => {
                           || ((a.dueTime||"24:00").localeCompare(b.dueTime||"24:00")));
 };
 
+// Changing lists: a wait counts from the day it starts, and who was waited on doesn't follow the item out.
+const relist = (item, from, to, day) =>
+  to === "waiting" ? { ...item, waitingSince: item.waitingSince || day }
+  : from === "waiting" && to !== "done" ? { ...item, waitingFor:"", waitingSince:"" } : item;
+// A wait that began as a capture days earlier is as old as the delegation, not the capture.
+const waitDays = (item, now) => Math.max(0, Math.floor((now - new Date(item.waitingSince ? item.waitingSince+"T00:00" : item.created).getTime()) / 86400000)) || 0;
+// Where a Done item goes back to. Items finished before the list was recorded have none,
+// so anything other items still point at is taken for a project.
+const restoreList = (state, item) =>
+  item.doneFrom !== "done" && LISTS.indexOf(item.doneFrom) >= 0 ? item.doneFrom
+  : LISTS.some(l => (state[l]||[]).some(i => i.projectId === item.id)) ? "projects" : "next";
+// Next Actions order: overdue, then today's stars, then by due date; the rest stay as stored.
+const engageSort = (list, day) => {
+  const rank = i => i.dueDate && i.dueDate < day ? 0 : i.focusDate === day ? 1 : i.dueDate ? 2 : 3;
+  return list.map((i, k) => [i, k]).sort(([a, x], [b, y]) =>
+    rank(a) - rank(b) || (a.dueDate||"").localeCompare(b.dueDate||"") || x - y).map(([i]) => i);
+};
+// "I have this much time/energy": what needs that or less, and whatever was never sized.
+const fitsLevel = (scale, need, have) => have === "all" || !need || scale.indexOf(need) <= scale.indexOf(have);
+// Case-insensitive match on what the owner can see of an item.
+const matchesText = (i, q) => !q.trim() || [i.title, i.note, i.waitingFor, i.context].some(v => String(v||"").toLowerCase().indexOf(q.trim().toLowerCase()) >= 0);
+
 // ── AI ops ────────────────────────────────────────────────────
 // Claude never sees a real item id (they're floats — costly to serialize, easy to
 // mangle) and never mutates anything itself. aiProjection mints short aliases
@@ -272,7 +294,7 @@ const todayRows = (state, todayISO) => {
 const AI_OPS       = ["add","update","move","link","focus","complete","trash","remember"];
 const AI_OPS_MAX   = 40;                                 // a runaway model may not rewrite the system
 const AI_ADD_LISTS = LISTS.filter(l => l !== "done");    // reaching done is `complete`, not `add`
-const AI_PATCH     = ["title","context","dueDate","dueTime","startDate","waitingFor","energy","time"];
+const AI_PATCH     = ["title","note","context","dueDate","dueTime","startDate","waitingFor","energy","time"];
 const AI_LETTER    = { inbox:"i", next:"n", projects:"p", waiting:"w", someday:"s", reference:"r", done:"d" };
 const aiIsDate     = v => /^\d{4}-\d{2}-\d{2}$/.test(String(v||""));
 const aiIsTime     = v => /^\d{2}:\d{2}$/.test(String(v||""));
@@ -315,6 +337,7 @@ const aiProjection = (state, todayISO, opts) => {
         if (i.dueDate)    f.push("due " + i.dueDate + (i.dueTime ? " " + i.dueTime : ""));
         if (i.startDate)  f.push("start " + i.startDate);
         if (i.waitingFor) f.push("for:" + i.waitingFor);
+        if (i.note)       f.push("note: " + String(i.note).replace(/\s+/g, " ").slice(0, 200));
         if (todayISO && i.focusDate === todayISO) f.push("focus");
         if (i.projectId)  f.push("proj " + (alias.get(i.projectId) || names.get(i.projectId) || "?"));
         const et = [i.energy ? "E:"+i.energy : "", i.time ? "T:"+i.time : ""].filter(Boolean).join(" ");
@@ -433,7 +456,7 @@ const applyAiOps = (state, ops, opts) => {
     if (op.op === "complete") {
       if (hit.list === "done") return skip("noop");
       pull(hit.list, hit.idx);
-      n = { ...n, done: [{ ...was, doneAt: ts() }, ...(n.done||[])] };
+      n = { ...n, done: [{ ...was, doneAt: ts(), doneFrom: hit.list }, ...(n.done||[])] };
       return done(`complete: ${name}`);
     }
     if (op.op === "focus") {
@@ -451,7 +474,7 @@ const applyAiOps = (state, ops, opts) => {
       return done(p ? `link: ${name} → ${projIndex(n).get(p) || "project"}` : `unlink: ${name}`);
     }
 
-    const next = { ...was };
+    let next = { ...was };
     patch(op, next, clamped);
     if ("project" in op) { const p = projOf(op.project, clamped); if (p != null) next.projectId = p; }
     if (op.op === "update") {
@@ -468,7 +491,8 @@ const applyAiOps = (state, ops, opts) => {
       return done(`update: ${(next.title||"").trim()}`);
     }
     pull(hit.list, hit.idx);
-    if (to === "done") next.doneAt = ts();
+    next = relist(next, hit.list, to, (opts && opts.todayISO) || isoDate(new Date()));
+    if (to === "done") { next.doneAt = ts(); next.doneFrom = hit.list; }
     n = { ...n, [to]: [next, ...(n[to]||[])] };
     return done(`${(next.title||"").trim()} → ${to}`);
   });
@@ -504,7 +528,8 @@ const pomoBreakMs = (done, cfg = POMO_DEFAULTS, now) =>
   (done % cfg.every === 0 && !(cfg.atWork && pomoOfficeHours(now)) ? cfg.long : cfg.short) * 60000;
 const pomoStart = (cur, item, now, cfg = POMO_DEFAULTS) => ({
   phase:"work", itemId: item ? item.id : null, title: item ? (item.title||"") : "",
-  done: cur ? cur.done : 0, marks:0, endsAt: now + cfg.work*60000,
+  // a run belongs to its day: this morning's first session doesn't continue last night's count
+  done: cur && isoDate(cur.at != null ? cur.at : now) === isoDate(now) ? cur.done : 0, marks:0, endsAt: now + cfg.work*60000, at: now,
 });
 // `ms` overrides the suggested length: the owner may take the other break (no long one at the office).
 const pomoBreakStart = (cur, now, cfg = POMO_DEFAULTS, ms = pomoBreakMs(cur.done, cfg, now)) => ({ ...cur, phase:"break", endsAt: now + ms });
@@ -539,7 +564,7 @@ const applyWidgetOps = (state, ops, now, day) => {
       TODAY_LISTS.forEach(l => {
         const it = (n[l]||[]).find(i => String(i.id) === id);
         if (!it) return;
-        n = { ...n, [l]: n[l].filter(i => String(i.id) !== id), done:[{...it, doneAt:now}, ...n.done] };
+        n = { ...n, [l]: n[l].filter(i => String(i.id) !== id), done:[{...it, doneAt:now, doneFrom:l}, ...n.done] };
       });
     } else if (op.op === "focus" && id && (n.next||[]).some(i => String(i.id) === id)) {
       n = { ...n, next: n.next.map(i => String(i.id) === id
@@ -549,6 +574,14 @@ const applyWidgetOps = (state, ops, now, day) => {
   return n;
 };
 // The ring ahead of this timer, for a native alarm that fires while the page can't run.
+// The last day before `day` with finished sessions, within a week: after a weekend "yesterday" says nothing.
+const pomoLastDay = (state, day) => {
+  for (let k = 1; k <= 7; k++) {
+    const d = isoDate(new Date(day+"T12:00").getTime() - k*86400000), n = pomoTally(state, d, d);
+    if (n) return { day:d, count:n, ago:k };
+  }
+  return null;
+};
 const pomoAlarms = t => (t && t.endsAt ? [{ at:t.endsAt, body:POMO_MSG[t.phase] }] : []);
 const pomoClock = ms => {
   const s = Math.max(0, Math.ceil(ms/1000));

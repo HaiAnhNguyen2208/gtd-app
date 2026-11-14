@@ -1,7 +1,7 @@
 // The pure half of the app, loaded as a plain script before the UI.
 
 // Default contexts — seed only. Since schema v2 the live list is state.contexts,
-// editable in-app (Sync & Backup → Contexts); this constant is the fallback/seed.
+// editable in-app (Settings → Contexts); this constant is the fallback/seed.
 const CONTEXTS = ["@anywhere","@calls","@computer","@errands","@home","@office"];
 // GTD's other two "engage" criteria beyond context: energy available and time at hand.
 // Optional on a Next Action; "" = unset. Stored as these literal labels.
@@ -484,22 +484,30 @@ const applyAiOps = (state, ops, opts) => {
 // The timer is device-local; only finished sessions (item.pomos, {day: count}) go
 // through sync. A session is indivisible: there is no pause or task switch, stopping
 // voids it, and completing the action mid-session doesn't end it.
-const POMO_DEFAULTS = { work:25, short:5, long:15, every:4 };     // minutes, and sessions per long break
+const POMO_DEFAULTS = { work:25, short:5, long:15, every:4, atWork:false };     // minutes, sessions per long break, and no long break in office hours
 const POMO_LIMITS = { work:[1,180], short:[1,60], long:[1,120], every:[1,12] };
 // Whatever came in (a typed value, an old state, another device): every field usable.
 const pomoSettings = raw => Object.fromEntries(Object.keys(POMO_DEFAULTS).map(k => {
+  if (k === "atWork") return [k, !!(raw && raw[k])];
   const v = raw && raw[k] != null ? Math.round(Number(raw[k])) : NaN;
   const [lo, hi] = POMO_LIMITS[k];
   return [k, Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : POMO_DEFAULTS[k]];
 }));
 const POMO_SPLIT = 5;     // this many sessions on one action: it's really a project
 const POMO_MSG = { work:"Pomodoro done — take a break.", break:"Break over." };
-const pomoBreakMs = (done, cfg = POMO_DEFAULTS) => (done % cfg.every === 0 ? cfg.long : cfg.short) * 60000;
+// Mon-Fri 8:00-11:30 and 13:00-17:00 on this device's clock: a long break doesn't fit the office.
+const pomoOfficeHours = now => {
+  const d = new Date(now), m = d.getHours()*60 + d.getMinutes();
+  return d.getDay() >= 1 && d.getDay() <= 5 && ((m >= 480 && m < 690) || (m >= 780 && m < 1020));
+};
+const pomoBreakMs = (done, cfg = POMO_DEFAULTS, now) =>
+  (done % cfg.every === 0 && !(cfg.atWork && pomoOfficeHours(now)) ? cfg.long : cfg.short) * 60000;
 const pomoStart = (cur, item, now, cfg = POMO_DEFAULTS) => ({
   phase:"work", itemId: item ? item.id : null, title: item ? (item.title||"") : "",
   done: cur ? cur.done : 0, marks:0, endsAt: now + cfg.work*60000,
 });
-const pomoBreakStart = (cur, now, cfg = POMO_DEFAULTS) => ({ ...cur, phase:"break", endsAt: now + pomoBreakMs(cur.done, cfg) });
+// `ms` overrides the suggested length: the owner may take the other break (no long one at the office).
+const pomoBreakStart = (cur, now, cfg = POMO_DEFAULTS, ms = pomoBreakMs(cur.done, cfg, now)) => ({ ...cur, phase:"break", endsAt: now + ms });
 // Same object back when nothing expired.
 const pomoTick = (cur, now) => {
   if (cur && cur.phase === "work" && cur.endsAt <= now)

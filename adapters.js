@@ -305,7 +305,7 @@ const Ai = {
   async _err(res) {
     let detail = "";
     try { const b = await res.json(); detail = (b && b.error && b.error.message) || ""; } catch {}
-    if (res.status === 401) return this._fail("auth", "That API key was rejected. Check it in Sync & Backup → Claude.");
+    if (res.status === 401) return this._fail("auth", "That API key was rejected. Check it in Settings → Claude.");
     if (res.status === 403) return this._fail("perm", "This key isn't allowed to call the Messages API.");
     if (res.status === 429) {
       const ra = res.headers.get("retry-after");

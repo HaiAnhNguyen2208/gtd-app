@@ -3,7 +3,7 @@
  * App shell (HTML, scripts, CDN React + icons) is precached on install and
  * served cache-first. */
 
-const CACHE = "gtd-v47";
+const CACHE = "gtd-v48";
 
 const SHELL = [
   "./",

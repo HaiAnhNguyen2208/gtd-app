@@ -48,6 +48,8 @@ const isOver  = d  => d && new Date(d+"T23:59") < new Date();
 // GTD tickler: an item with a future start date is "deferred" — hidden from the active
 // Next Actions / Waiting / Today lists until its start day, then it resurfaces.
 const isDeferred = (i, today) => i.startDate && i.startDate > today;
+// Due before the start date: the item would stay hidden past its own deadline.
+const datesClash = (start, due) => !!(start && due && due < start);
 const fresh   = () => ({ schemaVersion:SCHEMA_VERSION, inbox:[], next:[], projects:[], waiting:[], someday:[], reference:[], done:[],
                          contexts:[...CONTEXTS], agentContext:"", pomoConfig:{ ...POMO_DEFAULTS }, tombstones:{}, _reviewedAt:0, _metaUpdatedAt:0, _updatedAt:0 });
 // How we were launched. The OS/launcher starts us at start_url with a query:
@@ -410,6 +412,7 @@ const applyAiOps = (state, ops, opts) => {
       into[f] = v;
     });
     if (!into.dueDate) into.dueTime = "";     // a bare time is meaningless (mirrors the add form)
+    if (datesClash(into.startDate, into.dueDate)) { into.startDate = ""; clamped.push("startDate"); }   // the deadline is the real one
   };
   const put  = (list, idx, item) => { const a = [...(n[list]||[])]; a[idx] = item; n = { ...n, [list]: a }; };
   const pull = (list, idx)       => { n = { ...n, [list]: (n[list]||[]).filter((_,k) => k !== idx) }; };

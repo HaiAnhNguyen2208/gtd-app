@@ -491,7 +491,7 @@ const AGENT_TOOLS = [
       ops:{ type:"array", items:AI_OP_SCHEMA, description:"At most 20 ops." } } } },
 ];
 
-const AGENT_READ_TOOL = { name:"read_file", description:"Read one attached file by its exact listed path. Text comes back in chunks; a PDF comes back whole and costs far more, so read text first.",
+const AGENT_READ_TOOL = { name:"read_file", description:"Read one attached file by its exact listed path. Text comes back in chunks; an image (png, jpg, gif, webp) comes back as a picture; a PDF comes back whole and costs far more, so read text first.",
   input_schema:{ type:"object", additionalProperties:false, required:["path"], properties:{
     path:{ type:"string" }, offset:{ type:"integer", description:"Character to continue from, for text files." } } } };
 // Per-turn allowances: everything read is resent on each step of the turn, and a PDF is
@@ -500,6 +500,8 @@ const ATTACH_TURN_CHARS = 400000;
 const ATTACH_TURN_PDF   = 15 * 1048576;
 const ATTACH_TEXT_MAX   = 50 * 1048576;
 const AGENT_FILE_STEPS  = 12;
+const ATTACH_IMAGE      = { png:"image/png", jpg:"image/jpeg", jpeg:"image/jpeg", gif:"image/gif", webp:"image/webp" };
+const ATTACH_IMAGE_MAX  = 3.5 * 1048576;   // the API takes 5 MB per image, counted after base64
 const toBase64 = buf => {
   const bytes = new Uint8Array(buf);
   let bin = "";
@@ -517,6 +519,13 @@ const agentReadFile = async (input, attached, budget) => {
       if (e.size > budget.pdf) return fail(`${e.path} is ${attachSize(e.size)}, over the ${attachSize(budget.pdf)} of PDF left this turn. Say so and work from the other files.`);
       budget.pdf -= e.size;
       return { content:[{ type:"document", source:{ type:"base64", media_type:"application/pdf", data: toBase64(await e.file.arrayBuffer()) } }] };
+    }
+    const image = ATTACH_IMAGE[(/\.(\w+)$/.exec(e.path) || ["", ""])[1].toLowerCase()];
+    if (image) {
+      // images share the PDF allowance: both are resent whole on every step of the turn
+      if (e.size > ATTACH_IMAGE_MAX || e.size > budget.pdf) return fail(`${e.path} is ${attachSize(e.size)}, too large to look at this turn.`);
+      budget.pdf -= e.size;
+      return { content:[{ type:"image", source:{ type:"base64", media_type:image, data: toBase64(await e.file.arrayBuffer()) } }] };
     }
     if (e.size > ATTACH_TEXT_MAX) return fail(`${e.path} is ${attachSize(e.size)}, too large to read.`);
     const text = await e.file.text();

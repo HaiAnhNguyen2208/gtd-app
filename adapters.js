@@ -231,6 +231,29 @@ const Pomo = {
     try { this._audio(); } catch {}
     try { if (window.Notification && Notification.permission === "default") Notification.requestPermission(); } catch {}
   },
+  // The minutes left, drawn in place of the logo: the tab's icon in a browser, the window icon and
+  // the taskbar overlay in the desktop shell. An empty text puts the logo back.
+  _logo: null,
+  badge(text, color) {
+    try {
+      let url = null;
+      if (text) {
+        const c = document.createElement("canvas"); c.width = c.height = 64;
+        const g = c.getContext("2d");
+        g.fillStyle = color; g.beginPath(); g.arc(32, 32, 32, 0, 7); g.fill();
+        g.fillStyle = "#fff"; g.textAlign = "center"; g.textBaseline = "middle";
+        g.font = `bold ${text.length > 2 ? 30 : 42}px sans-serif`;
+        g.fillText(text, 32, 35);
+        url = c.toDataURL();
+      }
+      const link = document.querySelector('link[rel="icon"]');
+      if (link) {
+        if (!this._logo) this._logo = [link.href, link.type];
+        [link.href, link.type] = url ? [url, "image/png"] : this._logo;
+      }
+      if (window.GTDDesktop && GTDDesktop.icon) GTDDesktop.icon(url);
+    } catch {}
+  },
   alert(body) {
     try {
       const a = this._audio();

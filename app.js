@@ -1,5 +1,5 @@
 const { useState, useEffect, useCallback } = React;
-const APP_VERSION = "v48";
+const APP_VERSION = "v49";
 const LAUNCH = readLaunchIntent();
 const EMPTY_FORM = { title: "", projectId: "", context: "@anywhere", dueDate: "", dueTime: "", startDate: "", waitingFor: "", energy: "", time: "" };
 function App() {
@@ -248,6 +248,7 @@ function App() {
   useEffect(() => {
     if (!loaded || LAUNCH.headless) return;
     const baseTitle = document.title;
+    let badge = null;
     const tick = () => {
       const cur = Pomo.load(), now = Date.now();
       const { timer, credited, finished } = pomoTick(cur, now);
@@ -271,12 +272,19 @@ function App() {
         return d === t ? d : t;
       });
       document.title = timer && timer.endsAt ? `${pomoClock(timer.endsAt - now)} ${timer.phase === "work" ? "🍅" : "☕"} ${baseTitle}` : timer && timer.phase === "rest" ? `☕ Session done · ${baseTitle}` : timer && timer.phase === "idle" ? `🍅 Break over · ${baseTitle}` : baseTitle;
+      const mins = timer && timer.endsAt ? String(Math.ceil((timer.endsAt - now) / 6e4)) : "";
+      const color = timer && timer.phase === "work" ? "#b91c1c" : "#166534";
+      if (mins + color !== badge) {
+        badge = mins + color;
+        Pomo.badge(mins, color);
+      }
     };
     tick();
     const id = setInterval(tick, 1e3);
     return () => {
       clearInterval(id);
       document.title = baseTitle;
+      Pomo.badge("");
     };
   }, [loaded, persist]);
   const savePomo = (t) => {
@@ -3066,7 +3074,21 @@ function DataModal({ counts, archiveCount, pomoConfig, onPomoConfig, contexts, o
       onChange: (e) => setNewCtx(e.target.value),
       onKeyDown: (e) => e.key === "Enter" && fireAddCtx()
     }
-  ), /* @__PURE__ */ React.createElement("button", { onClick: fireAddCtx, className: "btn btn-pri btn-sm" }, "Add")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginTop: 6 } }, "Contexts live in your data and sync everywhere. Removing one doesn't touch existing items.")), window.AndroidWidget ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", lineHeight: 1.5, border: "1px solid #e2e8f0", borderRadius: 8, padding: "10px 12px" } }, /* @__PURE__ */ React.createElement("strong", null, "Backup files"), " can't be saved or opened inside the Android app. Use the desktop app or a browser; OneDrive already holds this phone's data.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: head }, "Export"), /* @__PURE__ */ React.createElement("button", { onClick: onExport, style: { ...card("#f5f3ff", "#6366f1", "#4338ca"), marginBottom: 16 } }, "💾 Save backup file", /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, fontWeight: 400, color: "#6366f1", marginTop: 2 } }, "Downloads gtd-backup-….json (uses the share sheet on phones)")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: ".8px", marginBottom: 8 } }, "Import from a backup file"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 7 } }, /* @__PURE__ */ React.createElement("button", { onClick: () => onImport("merge"), style: card("#f0fdf4", "#10b981", "#065f46") }, "➕ Merge — keep both", /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, fontWeight: 400, color: "#10b981", marginTop: 2 } }, "Adds the file's items to this device (same items aren't duplicated)")), /* @__PURE__ */ React.createElement("button", { onClick: () => onImport("replace"), style: card("#fef2f2", "#fca5a5", "#b91c1c") }, "♻️ Replace — overwrite this device", /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, fontWeight: 400, color: "#ef4444", marginTop: 2 } }, "Discards what's here and loads the file exactly")))), /* @__PURE__ */ React.createElement("button", { onClick: onClose, className: "btn btn-ghost btn-sm", style: { marginTop: 14, width: "100%" } }, "Close")));
+  ), /* @__PURE__ */ React.createElement("button", { onClick: fireAddCtx, className: "btn btn-pri btn-sm" }, "Add")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginTop: 6 } }, "Contexts live in your data and sync everywhere. Removing one doesn't touch existing items.")), window.AndroidWidget ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "#64748b", lineHeight: 1.5, border: "1px solid #e2e8f0", borderRadius: 8, padding: "10px 12px" } }, /* @__PURE__ */ React.createElement("strong", null, "Backup files"), " can't be saved or opened inside the Android app. Use the desktop app or a browser; OneDrive already holds this phone's data.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: head }, "Export"), /* @__PURE__ */ React.createElement("button", { onClick: onExport, style: { ...card("#f5f3ff", "#6366f1", "#4338ca"), marginBottom: 16 } }, "💾 Save backup file", /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, fontWeight: 400, color: "#6366f1", marginTop: 2 } }, "Downloads gtd-backup-….json (uses the share sheet on phones)")), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: ".8px", marginBottom: 8 } }, "Import from a backup file"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 7 } }, /* @__PURE__ */ React.createElement("button", { onClick: () => onImport("merge"), style: card("#f0fdf4", "#10b981", "#065f46") }, "➕ Merge — keep both", /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, fontWeight: 400, color: "#10b981", marginTop: 2 } }, "Adds the file's items to this device (same items aren't duplicated)")), /* @__PURE__ */ React.createElement("button", { onClick: () => onImport("replace"), style: card("#fef2f2", "#fca5a5", "#b91c1c") }, "♻️ Replace — overwrite this device", /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, fontWeight: 400, color: "#ef4444", marginTop: 2 } }, "Discards what's here and loads the file exactly")))), /* @__PURE__ */ React.createElement(UpdateCheck, null), /* @__PURE__ */ React.createElement("button", { onClick: onClose, className: "btn btn-ghost btn-sm", style: { marginTop: 14, width: "100%" } }, "Close")));
+}
+function UpdateCheck() {
+  const [msg, setMsg] = useState("");
+  const check = async () => {
+    setMsg("Checking…");
+    try {
+      const reg = await navigator.serviceWorker.getRegistration();
+      await reg.update();
+      setMsg(reg.installing || reg.waiting ? "A new version is downloading. The refresh prompt follows." : "This is the latest version.");
+    } catch {
+      setMsg("Couldn't check. Are you offline?");
+    }
+  };
+  return /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginTop: 16, fontSize: 11, color: "#64748b" } }, /* @__PURE__ */ React.createElement("span", null, "GTD ", APP_VERSION), /* @__PURE__ */ React.createElement("button", { onClick: check, disabled: msg === "Checking…", className: "btn btn-ghost btn-sm" }, "Check for updates"), /* @__PURE__ */ React.createElement("span", { role: "status" }, msg));
 }
 const Tag = ({ bg, c, children }) => /* @__PURE__ */ React.createElement("span", { className: "tag", style: { background: bg, color: c, fontSize: 11, padding: "2px 8px", borderRadius: 20, fontWeight: 500 } }, children);
 function EmptyState({ list, ctx }) {
